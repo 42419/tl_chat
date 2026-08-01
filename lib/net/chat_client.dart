@@ -9,6 +9,7 @@ import 'package:tailscale/tailscale.dart';
 
 import 'chat_cache.dart';
 import 'chat_protocol.dart';
+import '../services/notifications.dart';
 
 enum MessageStatus { sending, sent, delivered, read }
 
@@ -522,6 +523,14 @@ class ChatClient extends ChangeNotifier {
       if (!msg.isMine) sendReadReceipt(threadId);
     } else {
       conv.unread++;
+      // Android 推送：非活跃会话收到新消息时弹通知（后台/其他会话页）。
+      unawaited(
+        NotificationService.instance.showMessageNotification(
+          conversationId: threadId,
+          title: displayName(from),
+          body: text.isEmpty ? '（新消息）' : text,
+        ),
+      );
     }
     _persist(conv);
     notifyListeners();
@@ -557,6 +566,9 @@ class ChatClient extends ChangeNotifier {
   void _onOfflineHistory(ChatFrame frame) {
     // Hub responds to `offline` with stored StoredMessage rows, shaped:
     // { id, roomId, sender, recipient, payload, ts, delivered }.
+    // `initial: true` marks the connect-time backlog — don't spam
+    // notifications for old messages (only live/queued-flush notify).
+    final isInitialPull = frame.payload?['initial'] == true;
     final messages = (frame.payload?['messages'] as List?) ?? const [];
     for (final raw in messages) {
       if (raw is! Map) continue;
@@ -604,6 +616,16 @@ class ChatClient extends ChangeNotifier {
         sendReadReceipt(threadId);
       } else if (from != _myNodeId && threadId != activeConversationId) {
         conv.unread++;
+        // 连接后离线补发的消息弹通知；连接时的初始历史拉取不弹（避免刷屏）。
+        if (!isInitialPull) {
+          unawaited(
+            NotificationService.instance.showMessageNotification(
+              conversationId: threadId,
+              title: displayName(from),
+              body: text.isEmpty ? '（新消息）' : text,
+            ),
+          );
+        }
       }
       _persist(conv);
     }

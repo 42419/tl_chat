@@ -2,10 +2,26 @@
     <!-- The embedded Tailscale runtime needs network access to reach the
          control plane and tailnet peers. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Android 13+ 通知权限（新消息提醒 + 前台服务常驻通知） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 前台服务保活：保持后台连接，进程不被系统回收 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <application
         android:label="tl_chat"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+        <!-- 前台服务常驻通知使用的图标（flutter_foreground_task 通过
+             meta-data 名查找图标资源） -->
+        <meta-data
+            android:name="ic_launcher_foreground"
+            android:resource="@mipmap/ic_launcher" />
+        <!-- flutter_foreground_task 的前台服务声明（名称不可更改） -->
+        <service
+            android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

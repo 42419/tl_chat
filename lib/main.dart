@@ -7,9 +7,12 @@ import 'package:tailscale/tailscale.dart';
 
 import 'net/chat_client.dart';
 import 'net/chat_settings.dart';
+import 'services/notifications.dart';
 import 'ui/telegram_theme.dart';
 
-void main() {
+Future<void> main() async {
+  // Android 推送：初始化本地通知 + 前台服务保活配置（失败不阻塞启动）。
+  await NotificationService.instance.init();
   runApp(const ChatApp());
 }
 
@@ -73,10 +76,41 @@ class _HomePageState extends State<HomePage> {
   bool _autoLoginInFlight = false;
   bool _autoLoginDone = false;
 
+  /// 通知点击监听器 id（点击通知打开对应会话）。
+  int? _notificationTapListener;
+
   @override
   void initState() {
     super.initState();
     unawaited(_init());
+    _notificationTapListener = NotificationService.instance.addTapListener(
+      _openConversationFromNotification,
+    );
+  }
+
+  @override
+  void dispose() {
+    final listener = _notificationTapListener;
+    if (listener != null) {
+      NotificationService.instance.removeTapListener(listener);
+    }
+    _client.dispose();
+    _hostname.dispose();
+    _hubHost.dispose();
+    _hubPort.dispose();
+    _authKey.dispose();
+    _search.dispose();
+    super.dispose();
+  }
+
+  /// 通知点击：打开对应会话（群聊或 1:1）。
+  void _openConversationFromNotification(String conversationId) {
+    if (!mounted) return;
+    final conv = _client.conversationById(conversationId);
+    _openChat(
+      conversationId,
+      isRoom: conv?.isRoom ?? false,
+    );
   }
 
   /// Startup sequence: restore local history, load saved hub settings
@@ -93,17 +127,6 @@ class _HomePageState extends State<HomePage> {
     _hubPort.text = '${settings.hubPort}';
     await _loadStateDir();
     await _maybeAutoLogin();
-  }
-
-  @override
-  void dispose() {
-    _client.dispose();
-    _hostname.dispose();
-    _hubHost.dispose();
-    _hubPort.dispose();
-    _authKey.dispose();
-    _search.dispose();
-    super.dispose();
   }
 
   Future<void> _loadStateDir() async {
@@ -206,6 +229,8 @@ class _HomePageState extends State<HomePage> {
             ChatSettings(hostname: hostname, hubHost: hubHost, hubPort: port),
           ),
         );
+        // 连接成功后启动前台服务，保证后台持续接收消息。
+        unawaited(NotificationService.instance.startKeepAlive());
         setState(() => _showPanel = false);
       }
     } catch (e) {
@@ -274,6 +299,8 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _disconnect() async {
     await _client.disconnect();
+    // 断开后无需再保活，停止前台服务。
+    await NotificationService.instance.stopKeepAlive();
     if (mounted) setState(() {});
   }
 

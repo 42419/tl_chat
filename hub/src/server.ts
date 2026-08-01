@@ -318,10 +318,12 @@ export class Hub {
     const limit = (frame.payload?.['limit'] as number | undefined) ?? 200;
     // Full history: 1:1 in both directions + the node's room messages.
     const messages = this.store.historyFor(nodeId, this.router.roomsOf(nodeId), limit);
+    // `initial` marks the connect-time backlog so clients can suppress
+    // notification spam for old messages (only live/queued-flush notify).
     this.send(session, {
       type: 'offline',
       to: nodeId,
-      payload: { messages },
+      payload: { messages, initial: true },
     });
   }
 
