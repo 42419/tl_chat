@@ -37,7 +37,10 @@ export class Hub {
   readonly options: Required<HubOptions>;
   private readonly store: Store;
   private readonly router = new ChatRouter();
-  private readonly sessions = new Map<string, Session>();
+  // One node may hold several simultaneous connections (multi-device login).
+  // The same nodeId on a phone + a PC both stay registered; messages are
+  // pushed to EVERY session of the node so all devices stay in sync.
+  private readonly sessions = new Map<string, Set<Session>>();
   private server?: ReturnType<typeof createServer>;
   private heartbeat?: NodeJS.Timeout;
   private startedPort = 0;
@@ -91,7 +94,9 @@ export class Hub {
   }
 
   stop(): Promise<void> {
-    for (const session of this.sessions.values()) session.socket.destroy();
+    for (const set of this.sessions.values()) {
+      for (const session of set) session.socket.destroy();
+    }
     this.sessions.clear();
     this.store.close();
     if (this.heartbeat) clearInterval(this.heartbeat);
@@ -212,16 +217,22 @@ export class Hub {
       }
     }
 
-    // Replace any existing session for this node (one connection per node).
-    const existing = this.sessions.get(nodeId);
-    if (existing && existing !== session) existing.socket.destroy();
-
+    // Multi-device: keep every existing session for this node instead of
+    // replacing the old one, so a second device doesn't kick the first off.
     session.nodeId = nodeId;
     session.hostname = hostname;
-    this.sessions.set(nodeId, session);
+    let set = this.sessions.get(nodeId);
+    if (!set) {
+      set = new Set();
+      this.sessions.set(nodeId, set);
+    }
+    set.add(session);
     this.router.markOnline(nodeId);
 
-    // Flush queued (offline) messages.
+    // Flush queued (offline) messages to the newly connected session. Mark
+    // them delivered only when this is the node's ONLY session — if another
+    // session was already live it may still be missing them, and history
+    // pulls cover the rest.
     const queued = this.store.queuedFor(nodeId);
     for (const m of queued) {
       this.send(session, {
@@ -233,7 +244,7 @@ export class Hub {
         payload: { ...m.payload, queued: true, id: m.id },
       });
     }
-    if (queued.length > 0) {
+    if (queued.length > 0 && set.size === 1) {
       this.store.markDelivered(queued.map((m) => m.id));
       console.log(`[hub] flushed ${queued.length} queued message(s) to ${nodeId}`);
     }
@@ -246,12 +257,21 @@ export class Hub {
   private onDisconnect(session: Session): void {
     const nodeId = session.nodeId;
     if (!nodeId) return;
-    if (this.sessions.get(nodeId) === session) {
+    const set = this.sessions.get(nodeId);
+    if (!set) return;
+    set.delete(session);
+    // Only drop the node when its LAST session left (other devices still on).
+    if (set.size === 0) {
       this.sessions.delete(nodeId);
       this.router.markOffline(nodeId);
-      this.broadcastPresence();
       console.log(`[hub] offline: ${nodeId}`);
     }
+    this.broadcastPresence();
+  }
+
+  /** Every live session of a node (multi-device). */
+  private sessionsOf(nodeId: string): Session[] {
+    return [...(this.sessions.get(nodeId) ?? [])];
   }
 
   private onDirectMessage(session: Session, frame: ChatFrame): void {
@@ -273,16 +293,16 @@ export class Hub {
       { roomId: null, sender, recipient, payload, ts },
       this.sessions.has(recipient),
     );
-    const target = this.sessions.get(recipient);
-    if (target) {
-      this.send(target, {
-        type: 'msg',
-        from: sender,
-        to: recipient,
-        ts,
-        payload: { ...payload, id },
-      });
-    } else {
+    // Deliver to EVERY session of the recipient (all their devices), and also
+    // to the sender's other sessions so their own devices see it live.
+    const targets = this.sessionsOf(recipient);
+    for (const t of targets) {
+      this.send(t, { type: 'msg', from: sender, to: recipient, ts, payload: { ...payload, id } });
+    }
+    for (const t of this.sessionsOf(sender)) {
+      if (t !== session) this.send(t, { type: 'msg', from: sender, to: recipient, ts, payload: { ...payload, id } });
+    }
+    if (targets.length === 0) {
       console.log(`[hub] queued msg ${sender} -> ${recipient}`);
     }
     this.send(session, {
@@ -309,9 +329,10 @@ export class Hub {
     const reader = session.nodeId;
     const recipient = frame.to;
     if (!reader || !recipient) return;
-    const target = this.sessions.get(recipient);
-    if (target) {
-      this.send(target, {
+    // Forward to every session of the recipient so read state (blue check)
+    // syncs across their devices.
+    for (const t of this.sessionsOf(recipient)) {
+      this.send(t, {
         type: 'read',
         from: reader,
         to: recipient,
@@ -375,17 +396,19 @@ export class Hub {
       { roomId, sender, recipient: roomId, payload, ts },
       true,
     );
-    const members = this.router.roomMembers(roomId).filter((m) => m !== sender);
-    for (const member of members) {
-      const target = this.sessions.get(member);
-      if (target) {
-        this.send(target, {
-          type: 'room/msg',
-          from: sender,
-          roomId,
-          ts,
-          payload: { ...payload, id },
-        });
+    // Deliver to every session of every member (multi-device), including the
+    // sender's own other devices so their copies stay in sync live.
+    for (const member of this.router.roomMembers(roomId)) {
+      for (const t of this.sessionsOf(member)) {
+        if (t !== session) {
+          this.send(t, {
+            type: 'room/msg',
+            from: sender,
+            roomId,
+            ts,
+            payload: { ...payload, id },
+          });
+        }
       }
     }
     this.send(session, {
@@ -425,8 +448,13 @@ export class Hub {
       return;
     }
     const members = [...room.members].map((id) => {
-      const s = this.sessions.get(id);
-      return { id, hostname: s?.hostname ?? null, online: s !== undefined };
+      const set = this.sessions.get(id);
+      const online = set !== undefined && set.size > 0;
+      return {
+        id,
+        hostname: online ? (set.values().next().value as Session | undefined)?.hostname ?? null : null,
+        online,
+      };
     });
     this.send(session, {
       type: 'room/members',
@@ -440,13 +468,22 @@ export class Hub {
 
   private broadcastPresence(): void {
     // Carry hostnames so clients can show friendly titles instead of opaque
-    // stable node ids (family-chat UX requirement).
-    const online = [...this.sessions.values()]
-      .filter((s): s is Session & { nodeId: string; hostname: string } =>
-        s.nodeId !== null && s.hostname !== null)
-      .map((s) => ({ id: s.nodeId, hostname: s.hostname }));
+    // stable node ids (family-chat UX requirement). Dedupe by node id: a node
+    // with several devices appears once in the presence list.
+    const seen = new Set<string>();
+    const online: { id: string; hostname: string }[] = [];
+    for (const set of this.sessions.values()) {
+      for (const s of set) {
+        if (s.nodeId !== null && s.hostname !== null && !seen.has(s.nodeId)) {
+          seen.add(s.nodeId);
+          online.push({ id: s.nodeId, hostname: s.hostname });
+        }
+      }
+    }
     const frame: ChatFrame = { type: 'presence', payload: { online } };
-    for (const session of this.sessions.values()) this.send(session, frame);
+    for (const set of this.sessions.values()) {
+      for (const session of set) this.send(session, frame);
+    }
   }
 
   private broadcastRoomPresence(roomId: string): void {
@@ -456,22 +493,24 @@ export class Hub {
       roomId,
       payload: { online: members },
     };
+    // Deliver to every session of each member (multi-device).
     for (const member of members) {
-      const target = this.sessions.get(member);
-      if (target) this.send(target, frame);
+      for (const target of this.sessionsOf(member)) this.send(target, frame);
     }
   }
 
   private onHeartbeat(): void {
     const now = Date.now();
-    for (const [nodeId, session] of this.sessions) {
-      const idle = now - session.lastActivity;
-      if (idle > HEARTBEAT_MS && !session.pingOutstanding) {
-        session.pingOutstanding = true;
-        this.send(session, { type: 'ping' });
-      } else if (session.pingOutstanding && idle > HEARTBEAT_MS + PING_TIMEOUT_MS) {
-        console.warn(`[hub] heartbeat timeout, dropping ${nodeId}`);
-        session.socket.destroy();
+    for (const set of this.sessions.values()) {
+      for (const session of set) {
+        const idle = now - session.lastActivity;
+        if (idle > HEARTBEAT_MS && !session.pingOutstanding) {
+          session.pingOutstanding = true;
+          this.send(session, { type: 'ping' });
+        } else if (session.pingOutstanding && idle > HEARTBEAT_MS + PING_TIMEOUT_MS) {
+          console.warn(`[hub] heartbeat timeout, dropping ${session.nodeId ?? '?'}`);
+          session.socket.destroy();
+        }
       }
     }
   }

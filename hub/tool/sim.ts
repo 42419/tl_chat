@@ -214,8 +214,63 @@ async function main(): Promise<void> {
     );
     console.log('  ✓ room/list + room/members');
 
+    // multi-device: node-b opens a SECOND simultaneous session (phone + PC).
+    // Both sessions must stay registered and BOTH receive a message.
+    const bPhone = new SimClient(port, 'node-b', 'bob-phone');
+    await bPhone.hello();
+    await b2.waitFor((f) => f.type === 'presence');
+    console.log('  ✓ second device of node-b registered (hello -> ack ok)');
+
+    // presence stays deduped: node-b appears once despite two sessions.
+    const presence2 = await bPhone.waitFor((f) => f.type === 'presence');
+    const online2 =
+      (presence2.payload?.['online'] as { id: string; hostname: string }[] | undefined) ?? [];
+    const nodeBEntries = online2.filter((n) => n.id === 'node-b');
+    assert(nodeBEntries.length === 1, 'presence dedupes a node with two devices');
+
+    // 1:1 delivery reaches EVERY session of the recipient.
+    a.send({
+      type: 'msg',
+      from: 'node-a',
+      to: 'node-b',
+      ts: Date.now(),
+      payload: { text: '多设备同步' },
+    });
+    const onPc = await b2.waitFor(
+      (f) => f.type === 'msg' && f.payload?.['text'] === '多设备同步',
+    );
+    const onPhone = await bPhone.waitFor(
+      (f) => f.type === 'msg' && f.payload?.['text'] === '多设备同步',
+    );
+    assert(onPc.payload?.['text'] === '多设备同步', 'PC session got the message');
+    assert(onPhone.payload?.['text'] === '多设备同步', 'phone session got the message');
+    assert(
+      onPc.payload?.['id'] !== undefined && onPc.payload?.['id'] === onPhone.payload?.['id'],
+      'both sessions see the same hub id (client dedup key)',
+    );
+    console.log('  ✓ 1:1 message pushed to every session of the recipient');
+
+    // The SENDER's own other session also sees the message live.
+    // node-a: a (sending) + a2 (second device).
+    const a2 = new SimClient(port, 'node-a', 'alice-pc');
+    await a2.hello();
+    a.send({
+      type: 'msg',
+      from: 'node-a',
+      to: 'node-b',
+      ts: Date.now(),
+      payload: { text: '自己多端' },
+    });
+    const onA2 = await a2.waitFor(
+      (f) => f.type === 'msg' && f.payload?.['text'] === '自己多端',
+    );
+    assert(onA2.payload?.['text'] === '自己多端', "sender's other device got its own message live");
+    console.log('  ✓ sender\'s other device received the message in real-time');
+
     a.close();
+    a2.close();
     b2.close();
+    bPhone.close();
     console.log('\nALL SIM CHECKS PASSED ✓');
   } finally {
     await hub.stop();
