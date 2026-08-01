@@ -1,0 +1,24 @@
+{
+  "name": "hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TL Chat hub server — Tailscale intranet chat relay",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "npm run build && node dist/src/server.js",
+    "start:prod": "node dist/src/server.js",
+    "dev": "tsx src/server.ts",
+    "sim": "tsx tool/sim.ts",
+    "sim:prod": "npm run build && node dist/tool/sim.js",
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
+    "build": "node node_modules/typescript/bin/tsc -p tsconfig.build.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}

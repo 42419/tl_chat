@@ -1,30 +1,21 @@
-// This is a basic Flutter widget test.
+// Smoke test for the TL Chat app.
 //
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
+// Asserts only content rendered in the first viewport of the unconnected
+// home page (connection panel). No Tailscale node is started in tests, so
+// nothing native runs; the async state-dir lookup settles via pumpAndSettle.
 
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tl_chat/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  testWidgets('ChatApp renders the connection panel', (WidgetTester tester) async {
+    await tester.pumpWidget(const ChatApp());
+    await tester.pumpAndSettle();
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
-
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
-
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    expect(find.text('TL Chat'), findsOneWidget);
+    expect(find.text('接入 Hub'), findsOneWidget);
+    expect(find.text('连接'), findsOneWidget);
+    expect(find.text('节点主机名'), findsOneWidget);
   });
 }

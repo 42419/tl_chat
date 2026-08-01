@@ -1,4 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The embedded Tailscale runtime needs network access to reach the
+         control plane and tailnet peers. -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <application
         android:label="tl_chat"
         android:name="${applicationName}"
