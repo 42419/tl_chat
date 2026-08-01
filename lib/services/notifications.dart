@@ -50,6 +50,18 @@ const _kChatChannelId = 'tl_chat_messages';
 const _kChatChannelName = '聊天消息';
 const _kChatChannelDesc = '新消息、群聊消息提醒';
 
+/// 通知 payload 前缀（区分群聊 / 1:1，冷启动跳转时决定打开方式）。
+const _kRoomPrefix = 'room:'; // 群聊
+const _kDirectPrefix = 'chat:'; // 1:1
+
+/// 会话信息（id + 是否群聊），从通知 payload 解析得到。
+class NotificationConversation {
+  const NotificationConversation({required this.id, required this.isRoom});
+
+  final String id;
+  final bool isRoom;
+}
+
 class NotificationService {
   NotificationService._();
 
@@ -64,13 +76,23 @@ class NotificationService {
   /// 应用是否在前台（在前台且会话已打开时不再弹通知）。
   bool _appForegrounded = true;
 
-  final Map<int, void Function(String conversationId)> _tapListeners = {};
+  final Map<int, void Function(NotificationConversation conv)> _tapListeners =
+      {};
   int _tapListenerId = 0;
 
+  /// 冷启动点击通知时的暂存会话（应用启动时还没有监听器，先存起来）。
+  NotificationConversation? _pendingColdStart;
+
   /// 注册通知点击回调，返回可用于注销的 id。
-  int addTapListener(void Function(String conversationId) listener) {
+  int addTapListener(void Function(NotificationConversation conv) listener) {
     final id = ++_tapListenerId;
     _tapListeners[id] = listener;
+    // 补发冷启动暂存的会话（每次只消费一次）。
+    final pending = _pendingColdStart;
+    if (pending != null) {
+      _pendingColdStart = null;
+      listener(pending);
+    }
     return id;
   }
 
@@ -78,14 +100,46 @@ class NotificationService {
     _tapListeners.remove(id);
   }
 
+  /// 解析通知 payload 为会话信息（兼容无前缀的旧格式，视为 1:1）。
+  static NotificationConversation? parseConversation(String? payload) {
+    if (payload == null || payload.isEmpty) return null;
+    if (payload.startsWith(_kRoomPrefix)) {
+      final id = payload.substring(_kRoomPrefix.length);
+      if (id.isEmpty) return null;
+      return NotificationConversation(id: id, isRoom: true);
+    }
+    if (payload.startsWith(_kDirectPrefix)) {
+      final id = payload.substring(_kDirectPrefix.length);
+      if (id.isEmpty) return null;
+      return NotificationConversation(id: id, isRoom: false);
+    }
+    // 无前缀旧格式：hub 的群 id 形如 room_xxx，据此推断类型；其余按 1:1。
+    final isRoom = payload.startsWith('room_');
+    return NotificationConversation(id: payload, isRoom: isRoom);
+  }
+
   /// 通知点击 / 冷启动点击 —— 通知所有监听者（UI 打开对应会话）。
   void _onTap(String? payload) {
-    final convId = payload;
-    if (convId == null || convId.isEmpty) return;
+    final conv = parseConversation(payload);
+    if (conv == null) return;
     // 迭代快照：回调内可能移除监听器（如路由导航触发 dispose），避免
     // ConcurrentModificationError。
     for (final cb in _tapListeners.values.toList()) {
-      cb(convId);
+      cb(conv);
+    }
+  }
+
+  /// 冷启动检查：应用被通知点击拉起时读取启动详情，暂存等待监听器就绪。
+  /// 必须在 runApp 前（init() 中）调用。
+  Future<void> _captureColdStartLaunch() async {
+    try {
+      final details = await _fln.getNotificationAppLaunchDetails();
+      if (details?.didNotificationLaunchApp ?? false) {
+        final conv = parseConversation(details?.notificationResponse?.payload);
+        if (conv != null) _pendingColdStart = conv;
+      }
+    } catch (_) {
+      // 非 Android / 平台不可用时忽略
     }
   }
 
@@ -99,6 +153,8 @@ class NotificationService {
       settings: settings,
       onDidReceiveNotificationResponse: (resp) => _onTap(resp.payload),
     );
+    // 冷启动（应用被杀后点通知拉起）时读取启动来源，等待监听器注册后跳转。
+    await _captureColdStartLaunch();
 
     // Android 13+ 需要运行时通知权限（用于显示新消息通知）。
     if (defaultTargetPlatform == TargetPlatform.android) {
@@ -175,11 +231,12 @@ class NotificationService {
     }
   }
 
-  /// 收到新消息时弹出通知。payload 携带会话 id，点击后打开对应会话。
+  /// 收到新消息时弹出通知。payload 编码会话类型（群聊/1:1），点击后打开对应会话。
   Future<void> showMessageNotification({
     required String conversationId,
     required String title,
     required String body,
+    required bool isRoom,
   }) async {
     if (defaultTargetPlatform != TargetPlatform.android) return;
     if (_appForegrounded) return;
@@ -195,12 +252,15 @@ class NotificationService {
     );
     // 用会话 id 的哈希保证同会话的后续消息替换旧通知，避免通知栏堆叠。
     final id = conversationId.hashCode & 0x7fffffff;
+    final payload = isRoom
+        ? '$_kRoomPrefix$conversationId'
+        : '$_kDirectPrefix$conversationId';
     await _fln.show(
       id: id,
       title: title,
       body: body,
       notificationDetails: details,
-      payload: conversationId,
+      payload: payload,
     );
   }
 }

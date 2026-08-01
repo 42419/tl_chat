@@ -103,14 +103,10 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
-  /// 通知点击：打开对应会话（群聊或 1:1）。
-  void _openConversationFromNotification(String conversationId) {
+  /// 通知点击 / 冷启动点击：打开对应会话（群聊或 1:1，payload 已编码类型）。
+  void _openConversationFromNotification(NotificationConversation conv) {
     if (!mounted) return;
-    final conv = _client.conversationById(conversationId);
-    _openChat(
-      conversationId,
-      isRoom: conv?.isRoom ?? false,
-    );
+    _openChat(conv.id, isRoom: conv.isRoom);
   }
 
   /// Startup sequence: restore local history, load saved hub settings

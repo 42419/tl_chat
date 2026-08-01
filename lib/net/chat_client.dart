@@ -529,6 +529,7 @@ class ChatClient extends ChangeNotifier {
           conversationId: threadId,
           title: displayName(from),
           body: text.isEmpty ? '（新消息）' : text,
+          isRoom: roomId != null,
         ),
       );
     }
@@ -623,6 +624,7 @@ class ChatClient extends ChangeNotifier {
               conversationId: threadId,
               title: displayName(from),
               body: text.isEmpty ? '（新消息）' : text,
+              isRoom: roomId != null,
             ),
           );
         }
