@@ -6,6 +6,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:tailscale/tailscale.dart';
 
 import 'net/chat_client.dart';
+import 'net/chat_settings.dart';
 import 'ui/telegram_theme.dart';
 
 void main() {
@@ -67,13 +68,31 @@ class _HomePageState extends State<HomePage> {
   /// and benefits from the home page's AnimatedBuilder rebuilds.
   bool _showPanel = false;
 
+  /// Auto-login (WeChat/QQ style): once a node has registered, every later
+  /// launch reconnects by itself instead of asking the user to tap 连接.
+  bool _autoLoginInFlight = false;
+  bool _autoLoginDone = false;
+
   @override
   void initState() {
     super.initState();
-    unawaited(_loadStateDir());
+    unawaited(_init());
+  }
+
+  /// Startup sequence: restore local history, load saved hub settings
+  /// (prefilling the connect panel), then auto-login if the node was already
+  /// registered in a previous session.
+  Future<void> _init() async {
     // Restore locally cached history so chats are browsable offline before
     // (or without) connecting to the hub.
     unawaited(_client.loadLocalCache());
+    final settings = await ChatSettings.load();
+    if (!mounted) return;
+    _hostname.text = settings.hostname;
+    _hubHost.text = settings.hubHost;
+    _hubPort.text = '${settings.hubPort}';
+    await _loadStateDir();
+    await _maybeAutoLogin();
   }
 
   @override
@@ -103,6 +122,61 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
+  /// Auto-login (WeChat/QQ style): when the node was already registered in a
+  /// previous session (persisted Tailscale credentials exist), reconnect
+  /// automatically on launch — no auth key, no 连接 tap. First launch
+  /// (NodeState.noState) leaves the connect panel up instead.
+  Future<void> _maybeAutoLogin() async {
+    final stateDir = _stateDir;
+    if (!_tailscaleReady || stateDir == null) return;
+    if (_autoLoginDone || _client.connected) return;
+
+    NodeState state;
+    try {
+      Tailscale.init(stateDir: stateDir, logLevel: TailscaleLogLevel.error);
+      state = (await Tailscale.instance.status()).state;
+    } catch (_) {
+      // Engine not ready yet — nothing to auto-login with; show the panel.
+      return;
+    }
+    // noState = never authenticated. needsLogin / needsMachineAuth want the
+    // auth flow (the latter: authenticated but awaiting admin approval) — all
+    // of those intentionally fall through to the connect panel.
+    if (state == NodeState.noState ||
+        state == NodeState.needsLogin ||
+        state == NodeState.needsMachineAuth) {
+      return;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _autoLoginInFlight = true;
+      _tailscaleNote = '自动连接中…';
+    });
+    try {
+      await _connect();
+    } catch (_) {
+      // _connect already surfaced the error via _tailscaleNote (visible on the
+      // connect panel); give immediate feedback here too since the user may be
+      // browsing the cached conversation list instead.
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('自动连接失败'),
+            action: SnackBarAction(label: '重试', onPressed: _showConnectPanel),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _autoLoginInFlight = false;
+          _autoLoginDone = true;
+        });
+      }
+    }
+  }
+
   Future<void> _connect() async {
     if (!_tailscaleReady) return;
     final stateDir = _stateDir;
@@ -126,6 +200,12 @@ class _HomePageState extends State<HomePage> {
         hostname: hostname,
       );
       if (mounted) {
+        // Remember these settings so the next launch can auto-login.
+        unawaited(
+          ChatSettings.save(
+            ChatSettings(hostname: hostname, hubHost: hubHost, hubPort: port),
+          ),
+        );
         setState(() => _showPanel = false);
       }
     } catch (e) {
@@ -558,29 +638,40 @@ class _HomePageState extends State<HomePage> {
     return Column(
       children: [
         // Offline browsing banner: cached history is viewable without a
-        // connection; offer a way back to the connect panel.
+        // connection; offer a way back to the connect panel. While auto-login
+        // is running, show progress instead (WeChat-style silent reconnect).
         if (!_client.connected)
           Material(
             color: palette.chatBg,
             child: InkWell(
-              onTap: _showConnectPanel,
+              onTap: _autoLoginInFlight ? null : _showConnectPanel,
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
                 child: Row(
                   children: [
-                    Icon(Icons.cloud_off, size: 16, color: palette.subtext),
+                    if (_autoLoginInFlight)
+                      const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    else
+                      Icon(Icons.cloud_off, size: 16, color: palette.subtext),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        '离线模式：显示本地缓存记录',
+                        _autoLoginInFlight
+                            ? '正在自动连接…'
+                            : '离线模式：显示本地缓存记录',
                         style: theme.textTheme.bodySmall?.copyWith(
                           color: palette.subtext,
                         ),
                       ),
                     ),
                     TextButton(
-                      onPressed: _showConnectPanel,
-                      child: const Text('去连接'),
+                      onPressed:
+                          _autoLoginInFlight ? null : _showConnectPanel,
+                      child: Text(_autoLoginInFlight ? '连接中' : '去连接'),
                     ),
                   ],
                 ),
