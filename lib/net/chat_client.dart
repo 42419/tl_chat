@@ -123,6 +123,39 @@ class Conversation {
   }
 }
 
+/// A group room listing entry returned by `room/list` (P3 browse/join).
+class RoomSummary {
+  const RoomSummary({
+    required this.id,
+    required this.name,
+    required this.memberCount,
+    required this.isMember,
+  });
+
+  final String id;
+  final String name;
+  final int memberCount;
+  final bool isMember;
+}
+
+/// A member of a group room returned by `room/members`.
+class RoomMember {
+  const RoomMember({required this.id, this.hostname, required this.online});
+
+  final String id;
+  final String? hostname;
+  final bool online;
+}
+
+/// Group room details returned by `room/members`.
+class RoomInfo {
+  const RoomInfo({required this.roomId, required this.name, required this.members});
+
+  final String roomId;
+  final String name;
+  final List<RoomMember> members;
+}
+
 /// Thrown for protocol/connection errors surfaced to the UI.
 class HubException implements Exception {
   const HubException(this.message);
@@ -154,6 +187,9 @@ class ChatClient extends ChangeNotifier {
 
   Completer<void>? _helloAckCompleter;
   Completer<String>? _roomCreateCompleter;
+  Completer<bool>? _roomJoinCompleter;
+  Completer<List<RoomSummary>>? _roomListCompleter;
+  Completer<RoomInfo>? _roomMembersCompleter;
 
   /// nodeId -> hostname map, learned from presence + message senders.
   final Map<String, String> _names = {};
@@ -186,6 +222,14 @@ class ChatClient extends ChangeNotifier {
     return _conversations.putIfAbsent(
       nodeId,
       () => Conversation(id: nodeId, title: displayName(nodeId)),
+    );
+  }
+
+  /// Opens (creating if needed) a room conversation with the given title.
+  Conversation ensureRoomConversation(String roomId, String title) {
+    return _conversations.putIfAbsent(
+      roomId,
+      () => Conversation(id: roomId, title: title, isRoom: true),
     );
   }
 
@@ -331,6 +375,12 @@ class ChatClient extends ChangeNotifier {
       case 'room/msg':
         _onIncomingMessage(frame, roomId: frame.roomId);
         break;
+      case 'room/list':
+        _onRoomList(frame);
+        break;
+      case 'room/members':
+        _onRoomMembers(frame);
+        break;
       case 'presence':
         _onPresence(frame);
         break;
@@ -352,6 +402,33 @@ class ChatClient extends ChangeNotifier {
     final ok = frame.payload?['ok'] == true;
     final roomId = frame.payload?['roomId'] as String?;
 
+    // Room acks (create/join/msg) all carry roomId. The `joined` marker
+    // distinguishes room/join — and must be handled BEFORE the generic !ok
+    // rejection below, otherwise a failed join (ok:false) would be swallowed
+    // by the connection-failure path and the joinRoom() waiter would hang.
+    if (roomId != null && frame.payload?['joined'] is bool) {
+      // room/join ack — surface the result to the joinRoom() waiter.
+      final joined = frame.payload?['joined'] == true;
+      final waiter = _roomJoinCompleter;
+      _roomJoinCompleter = null;
+      if (waiter != null && !waiter.isCompleted) {
+        if (joined) {
+          _conversations.putIfAbsent(
+            roomId,
+            () => Conversation(
+              id: roomId,
+              title: (frame.payload?['name'] as String?) ?? roomId,
+              isRoom: true,
+            ),
+          );
+          waiter.complete(true);
+        } else {
+          waiter.completeError(const HubException('群不存在或无法加入'));
+        }
+      }
+      return;
+    }
+
     if (!ok) {
       final error = frame.payload?['error'] ?? 'unknown';
       _statusText = '被拒绝: $error';
@@ -368,9 +445,12 @@ class ChatClient extends ChangeNotifier {
     }
 
     if (roomId != null) {
-      // room/create ack — surface the room and release the waiter.
-      _roomCreateCompleter?.complete(roomId);
-      _roomCreateCompleter = null;
+      // room/create or room/msg ack (both carry roomId, neither has `joined`).
+      final createWaiter = _roomCreateCompleter;
+      if (createWaiter != null && !createWaiter.isCompleted) {
+        _roomCreateCompleter = null;
+        createWaiter.complete(roomId);
+      }
       _conversations.putIfAbsent(
         roomId,
         () => Conversation(
@@ -626,10 +706,49 @@ class ChatClient extends ChangeNotifier {
     );
   }
 
-  /// Joins an existing room by id.
-  void joinRoom(String roomId) {
-    if (!_connected) return;
+  /// Joins an existing room by id; completes with whether the join succeeded.
+  Future<bool> joinRoom(String roomId) {
+    if (!_connected) return Future.error(const HubException('未连接'));
+    final completer = Completer<bool>();
+    _roomJoinCompleter = completer;
     _write(ChatFrame(type: 'room/join', from: _myNodeId, roomId: roomId));
+    return completer.future.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        _roomJoinCompleter = null;
+        throw const HubException('加入群聊超时');
+      },
+    );
+  }
+
+  /// Fetches the list of existing rooms (P3 browse & join).
+  Future<List<RoomSummary>> listRooms() {
+    if (!_connected) return Future.error(const HubException('未连接'));
+    final completer = Completer<List<RoomSummary>>();
+    _roomListCompleter = completer;
+    _write(ChatFrame(type: 'room/list', from: _myNodeId));
+    return completer.future.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        _roomListCompleter = null;
+        throw const HubException('获取群列表超时');
+      },
+    );
+  }
+
+  /// Fetches a room's name + members with online status (P3 member list).
+  Future<RoomInfo> roomMembers(String roomId) {
+    if (!_connected) return Future.error(const HubException('未连接'));
+    final completer = Completer<RoomInfo>();
+    _roomMembersCompleter = completer;
+    _write(ChatFrame(type: 'room/members', from: _myNodeId, roomId: roomId));
+    return completer.future.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        _roomMembersCompleter = null;
+        throw const HubException('获取群成员超时');
+      },
+    );
   }
 
   void sendRoomMessage(String roomId, String text) {
@@ -686,6 +805,71 @@ class ChatClient extends ChangeNotifier {
         payload: {'lastTs': lastIncomingTs},
       ),
     );
+  }
+
+  void _onRoomList(ChatFrame frame) {
+    final completer = _roomListCompleter;
+    if (completer == null) return;
+    _roomListCompleter = null;
+    final raw = frame.payload?['rooms'];
+    if (raw is! List) {
+      if (!completer.isCompleted) {
+        completer.completeError(const HubException('群列表数据异常'));
+      }
+      return;
+    }
+    final rooms = raw.whereType<Map>().map((m) {
+      final map = Map<String, dynamic>.from(m);
+      return RoomSummary(
+        id: map['id'] as String? ?? '',
+        name: map['name'] as String? ?? '',
+        memberCount: (map['memberCount'] as num?)?.toInt() ?? 0,
+        isMember: map['isMember'] as bool? ?? false,
+      );
+    }).toList();
+    // Refresh room conversation titles when we learn their names.
+    for (final r in rooms) {
+      final conv = _conversations[r.id];
+      if (conv != null && conv.isRoom && conv.title == r.id) conv.title = r.name;
+    }
+    if (!completer.isCompleted) completer.complete(rooms);
+  }
+
+  void _onRoomMembers(ChatFrame frame) {
+    final completer = _roomMembersCompleter;
+    if (completer == null) return;
+    _roomMembersCompleter = null;
+    final roomId = frame.roomId ?? '';
+    final ok = frame.payload?['ok'] == true;
+    if (!ok) {
+      final err = (frame.payload?['error'] as String?) ?? '获取群成员失败';
+      if (!completer.isCompleted) completer.completeError(HubException(err));
+      return;
+    }
+    final name = (frame.payload?['name'] as String?) ?? roomId;
+    final raw = frame.payload?['members'];
+    if (raw is! List) {
+      if (!completer.isCompleted) {
+        completer.completeError(const HubException('群成员数据异常'));
+      }
+      return;
+    }
+    final members = raw.whereType<Map>().map((m) {
+      final map = Map<String, dynamic>.from(m);
+      final id = map['id'] as String? ?? '?';
+      final hostname = map['hostname'] as String?;
+      if (hostname != null && hostname.isNotEmpty) _names[id] = hostname;
+      return RoomMember(
+        id: id,
+        hostname: hostname,
+        online: map['online'] as bool? ?? false,
+      );
+    }).toList();
+    final conv = _conversations[roomId];
+    if (conv != null && conv.isRoom) conv.title = name;
+    if (!completer.isCompleted) {
+      completer.complete(RoomInfo(roomId: roomId, name: name, members: members));
+    }
   }
 
   void _write(ChatFrame frame) {

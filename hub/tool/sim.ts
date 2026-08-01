@@ -180,6 +180,40 @@ async function main(): Promise<void> {
     assert(roomMsg.payload?.['text'] === '群消息测试', 'B received room message');
     console.log('  ✓ group chat routed');
 
+    // P3: room/list + room/members — browse & view members
+    a.send({ type: 'room/list', from: 'node-a' });
+    const roomList = await a.waitFor((f) => f.type === 'room/list');
+    const rooms = (roomList.payload?.['rooms'] as {
+      id: string;
+      name: string;
+      memberCount: number;
+      isMember: boolean;
+    }[] | undefined) ?? [];
+    const listed = rooms.find((r) => r.id === roomId);
+    assert(listed !== undefined, 'room/list lists created room');
+    assert(
+      listed?.name === '家庭群' && listed?.memberCount === 2 && listed?.isMember === true,
+      'room/list carries name/memberCount/isMember',
+    );
+    b2.send({ type: 'room/members', from: 'node-b', roomId });
+    const membersResp = await b2.waitFor(
+      (f) => f.type === 'room/members' && f.roomId === roomId,
+    );
+    const members = (membersResp.payload?.['members'] as {
+      id: string;
+      online: boolean;
+    }[] | undefined) ?? [];
+    const memberIds = members.map((m) => m.id);
+    assert(
+      memberIds.includes('node-a') && memberIds.includes('node-b'),
+      'room/members lists both members',
+    );
+    assert(
+      membersResp.payload?.['name'] === '家庭群',
+      'room/members carries room name',
+    );
+    console.log('  ✓ room/list + room/members');
+
     a.close();
     b2.close();
     console.log('\nALL SIM CHECKS PASSED ✓');

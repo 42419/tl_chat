@@ -333,6 +333,14 @@ class _HomePageState extends State<HomePage> {
                 _createRoomDialog();
               },
             ),
+            ListTile(
+              leading: const Icon(Icons.group_outlined, color: Tg.blue),
+              title: const Text('加入群聊'),
+              onTap: () {
+                Navigator.of(sheetContext).pop();
+                _joinRoomSheet();
+              },
+            ),
             if (_client.onlineNodes.isEmpty)
               Padding(
                 padding: const EdgeInsets.all(16),
@@ -814,6 +822,122 @@ class _HomePageState extends State<HomePage> {
     return '${t.month}/${t.day}';
   }
 
+  /// Bottom sheet listing existing rooms to join (P3: 查看/加入已有群).
+  Future<void> _joinRoomSheet() async {
+    final palette = TgPalette.of(context);
+    List<RoomSummary> rooms;
+    try {
+      rooms = await _client.listRooms();
+    } on HubException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+      }
+      return;
+    }
+    if (!mounted) return;
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: palette.panel,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '加入群聊',
+                  style: Theme.of(sheetContext).textTheme.titleMedium,
+                ),
+              ),
+            ),
+            if (rooms.isEmpty)
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  '暂无群聊，先创建一个吧',
+                  style: Theme.of(sheetContext).textTheme.bodySmall?.copyWith(
+                    color: palette.subtext,
+                  ),
+                ),
+              )
+            else
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: rooms.length,
+                  itemBuilder: (context, i) {
+                    final room = rooms[i];
+                    return ListTile(
+                      leading: TgAvatar(
+                        id: room.id,
+                        size: 42,
+                        title: room.name,
+                        isRoom: true,
+                      ),
+                      title: Text(room.name),
+                      subtitle: Text(
+                        room.isMember
+                            ? '${room.memberCount} 名成员 · 已加入'
+                            : '${room.memberCount} 名成员',
+                      ),
+                      trailing: room.isMember
+                          ? const Icon(Icons.check_circle, size: 20, color: Tg.online)
+                          : null,
+                      onTap: () {
+                        Navigator.of(sheetContext).pop();
+                        _joinRoom(room);
+                      },
+                    );
+                  },
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _joinRoom(RoomSummary room) async {
+    if (!_client.connected) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('未连接，无法加入群聊')),
+      );
+      return;
+    }
+    // Already a member — just open the (possibly cached) conversation.
+    if (room.isMember) {
+      _openChat(room.id, isRoom: true);
+      return;
+    }
+    try {
+      final joined = await _client.joinRoom(room.id);
+      if (!joined) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('群不存在或无法加入')),
+          );
+        }
+        return;
+      }
+    } on HubException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+      }
+      return;
+    }
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已加入群聊「${room.name}」')),
+      );
+      _openChat(room.id, isRoom: true);
+    }
+  }
+
   Future<void> _createRoomDialog() async {
     final controller = TextEditingController();
     final name = await showDialog<String>(
@@ -856,11 +980,13 @@ class _HomePageState extends State<HomePage> {
 
   void _openChat(String id, {required bool isRoom}) {
     // Create the conversation on demand so tapping an online node (with no
-    // prior chat) starts a new 1:1 thread instead of silently doing nothing.
+    // prior chat) starts a new 1:1 thread, and a room we already joined but
+    // have no local conversation for (e.g. after cache clear) reopens
+    // instead of silently doing nothing.
     final conv = isRoom
-        ? _client.conversationById(id)
+        ? (_client.conversationById(id) ??
+            _client.ensureRoomConversation(id, id))
         : _client.openConversation(id);
-    if (conv == null) return;
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (context) => ChatPage(
@@ -1006,6 +1132,12 @@ class _ChatPageState extends State<ChatPage> {
           ],
         ),
         actions: [
+          if (widget.conversation.isRoom)
+            IconButton(
+              onPressed: _showRoomMembers,
+              icon: const Icon(Icons.people_outline, size: 20),
+              tooltip: '群成员',
+            ),
           IconButton(
             onPressed: widget.onToggleTheme,
             // Read from the live theme (not a captured flag) so the affordance
@@ -1102,6 +1234,89 @@ class _ChatPageState extends State<ChatPage> {
   bool _clientIsOnline(String nodeId) {
     if (nodeId == widget.client.myNodeId) return true;
     return widget.client.onlineNodes.contains(nodeId);
+  }
+
+  /// Bottom sheet with the room's member list (P3: 查看群成员).
+  Future<void> _showRoomMembers() async {
+    final palette = TgPalette.of(context);
+    RoomInfo info;
+    try {
+      info = await widget.client.roomMembers(widget.conversation.id);
+    } on HubException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+      }
+      return;
+    }
+    if (!mounted) return;
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: palette.panel,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '群成员（${info.members.length}）',
+                      style: Theme.of(sheetContext).textTheme.titleMedium,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (info.members.isEmpty)
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  '暂无成员',
+                  style: Theme.of(sheetContext).textTheme.bodySmall?.copyWith(
+                    color: palette.subtext,
+                  ),
+                ),
+              )
+            else
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: info.members.length,
+                  itemBuilder: (context, i) {
+                    final m = info.members[i];
+                    final isMe = m.id == widget.client.myNodeId;
+                    final title = isMe
+                        ? '${widget.client.displayName(m.id)}（我）'
+                        : widget.client.displayName(m.id);
+                    return ListTile(
+                      leading: TgAvatar(
+                        id: m.id,
+                        size: 42,
+                        title: widget.client.displayName(m.id),
+                        online: m.online,
+                      ),
+                      title: Text(title),
+                      subtitle: Text(m.online ? '在线' : '离线'),
+                      trailing: isMe
+                          ? null
+                          : Icon(
+                              m.online ? Icons.circle : Icons.circle_outlined,
+                              size: 12,
+                              color: m.online ? Tg.online : palette.subtext,
+                            ),
+                    );
+                  },
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   Widget _emptyState(ThemeData theme) {

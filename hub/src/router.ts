@@ -61,4 +61,9 @@ export class ChatRouter {
     }
     return ids;
   }
+
+  /** All rooms (for browsing / joining existing groups). */
+  allRooms(): Room[] {
+    return [...this.rooms.values()];
+  }
 }

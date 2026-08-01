@@ -159,6 +159,10 @@ export class Hub {
         return this.onRoomLeave(session, frame);
       case 'room/msg':
         return this.onRoomMessage(session, frame);
+      case 'room/list':
+        return this.onRoomList(session, frame);
+      case 'room/members':
+        return this.onRoomMembers(session, frame);
       default:
         this.send(session, {
           type: 'ack',
@@ -338,7 +342,13 @@ export class Hub {
     const joined = this.router.joinRoom(roomId, nodeId);
     const room = this.router.roomById(roomId);
     if (room) this.store.saveRoom(room);
-    this.send(session, { type: 'ack', to: nodeId, payload: { ok: joined, roomId } });
+    // `joined` marker distinguishes this ack from room/create and room/msg acks
+    // (all carry roomId) on the client side.
+    this.send(session, {
+      type: 'ack',
+      to: nodeId,
+      payload: { ok: joined, joined, roomId, name: room?.name },
+    });
     if (joined) this.broadcastRoomPresence(roomId);
   }
 
@@ -383,6 +393,46 @@ export class Hub {
       to: sender,
       roomId,
       payload: { ok: true, ts, id },
+    });
+  }
+
+  /** Lists all rooms so a client can browse and join existing groups (P3). */
+  private onRoomList(session: Session, frame: ChatFrame): void {
+    const nodeId = session.nodeId;
+    if (!nodeId) return;
+    const rooms = this.router.allRooms().map((room) => ({
+      id: room.id,
+      name: room.name,
+      memberCount: room.members.size,
+      isMember: room.members.has(nodeId),
+    }));
+    this.send(session, { type: 'room/list', to: nodeId, payload: { rooms } });
+  }
+
+  /** Returns a room's name + members with online status (P3). */
+  private onRoomMembers(session: Session, frame: ChatFrame): void {
+    const nodeId = session.nodeId;
+    const roomId = frame.roomId;
+    if (!nodeId || !roomId) return;
+    const room = this.router.roomById(roomId);
+    if (!room) {
+      this.send(session, {
+        type: 'room/members',
+        to: nodeId,
+        roomId,
+        payload: { ok: false, error: '群不存在' },
+      });
+      return;
+    }
+    const members = [...room.members].map((id) => {
+      const s = this.sessions.get(id);
+      return { id, hostname: s?.hostname ?? null, online: s !== undefined };
+    });
+    this.send(session, {
+      type: 'room/members',
+      to: nodeId,
+      roomId,
+      payload: { ok: true, name: room.name, members },
     });
   }
 
