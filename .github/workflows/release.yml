@@ -1,0 +1,118 @@
+name: 发布 Release 包
+
+# 触发方式：
+#   1. 推送 v* 标签（如 git tag v1.0.0 && git push --tags）→ 构建并发布 GitHub Release
+#   2. 手动触发（Actions → Run workflow）→ 仅构建并上传 artifact，不建 Release
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write # 创建 GitHub Release 需要
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: 构建 Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: 检出 tl_chat 代码
+        uses: actions/checkout@v4
+
+      - name: 检出 tailscale_dart fork 到路径依赖位置（../tailscale_dart）
+        uses: actions/checkout@v4
+        with:
+          repository: 42419/tailscale_dart
+          ref: main
+          path: ../tailscale_dart
+
+      - name: 设置 JDK 17（AGP 9 / Gradle 9 要求）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 设置 Go（tailscale 原生库 build hook 需要 Go 1.26+）
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x' # go.mod 声明 go 1.26.4，用 x 通配避免精确 patch 不可用
+          cache-dependency-path: ../tailscale_dart/go/go.sum # fork 检出在 workspace 兄弟目录
+
+      - name: 设置 Flutter（锁定版本，保证 native-assets hook 行为确定）
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.44.4'
+          cache: true
+
+      - name: 安装 Android NDK 并接受许可
+        shell: bash
+        run: |
+          SDKMGR="$(command -v sdkmanager || echo "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager")"
+          # 接受许可失败不阻塞（runner 通常已接受），但 NDK 必须装好，否则 tailscale hook 直接报错
+          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
+          if [ -z "${ANDROID_NDK_HOME:-}" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
+            "$SDKMGR" --install "ndk;27.2.12479018" >/dev/null 2>&1 \
+              || "$SDKMGR" --install "ndk;26.1.10909125"
+          fi
+          if [ -z "${ANDROID_NDK_HOME:-}" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
+            echo "::error::Android NDK 未安装，tailscale build hook 无法编译原生库"
+            exit 1
+          fi
+          echo "NDK: ${ANDROID_NDK_HOME:-$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | tail -1)}"
+
+      - name: 依赖、静态检查与测试
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
+      - name: 计算版本号（优先取 tag，如 v1.0.0+3 → name=1.0.0 number=3）
+        id: ver
+        run: |
+          VER=$(grep '^version:' pubspec.yaml | awk '{print $2}')
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+          fi
+          NAME="${VER%%+*}"
+          NUM="${VER#*+}"
+          [[ "$NUM" == "$VER" ]] && NUM="1"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+
+      - name: 配置 Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 构建通用 APK（全 ABI，模拟器/任意设备可装）
+        run: |
+          flutter build apk --release \
+            --build-name ${{ steps.ver.outputs.name }} \
+            --build-number ${{ steps.ver.outputs.number }}
+
+      - name: 构建按 ABI 分包 APK（手机安装更小）
+        run: |
+          flutter build apk --release --split-per-abi \
+            --build-name ${{ steps.ver.outputs.name }} \
+            --build-number ${{ steps.ver.outputs.number }}
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tl-chat-apk-${{ steps.ver.outputs.name }}
+          path: |
+            build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+
+      - name: 发布到 GitHub Release（仅 tag 触发）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: TL Chat ${{ steps.ver.outputs.name }}
+          files: build/app/outputs/flutter-apk/*.apk
+          generate_release_notes: true
