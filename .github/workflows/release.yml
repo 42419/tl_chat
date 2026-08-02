@@ -92,13 +92,7 @@ jobs:
       - name: Configure Gradle cache
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build universal APK (all ABIs; installable on any device/emulator)
-        run: |
-          flutter build apk --release \
-            --build-name ${{ steps.ver.outputs.name }} \
-            --build-number ${{ steps.ver.outputs.number }}
-
-      - name: Build split-per-ABI APKs (smaller for phone installs)
+      - name: Build split-per-ABI APKs (arm64-v8a / armeabi-v7a / x86_64)
         run: |
           flutter build apk --release --split-per-abi \
             --build-name ${{ steps.ver.outputs.name }} \
