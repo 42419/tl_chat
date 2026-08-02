@@ -74,3 +74,49 @@ class ChatCache {
     }
   }
 }
+
+/// Room-name registry: roomId -> display name.
+///
+/// Stored SEPARATELY from the chat-history cache (own JSON file), because a
+/// room's name is metadata that survives the user clearing their chat history:
+/// after re-login the client can render real group names immediately instead
+/// of waiting for the network `room/list` round-trip. The hub stays
+/// authoritative; this is only a fast-path mirror that may go stale.
+class RoomNames {
+  RoomNames._();
+
+  static Future<File> _file() async {
+    final support = await getApplicationSupportDirectory();
+    return File(p.join(support.path, 'room_names.json'));
+  }
+
+  /// Loads the room-name registry. Best-effort: missing/corrupt file and
+  /// platform errors (e.g. tests) return an empty map.
+  static Future<Map<String, String>> load() async {
+    final out = <String, String>{};
+    try {
+      final file = await _file();
+      if (!file.existsSync()) return out;
+      final json = jsonDecode(await file.readAsString());
+      if (json is! Map) return out;
+      for (final entry in json.entries) {
+        if (entry.key is String && entry.value is String) {
+          out[entry.key as String] = entry.value as String;
+        }
+      }
+    } catch (_) {
+      // corrupt file / platform unavailable — return what we have
+    }
+    return out;
+  }
+
+  /// Persists the whole registry (fire-and-forget from the client).
+  static Future<void> save(Map<String, String> names) async {
+    try {
+      final file = await _file();
+      await file.writeAsString(jsonEncode(names));
+    } catch (_) {
+      // best-effort: never break chat because the registry failed
+    }
+  }
+}

@@ -114,8 +114,10 @@ class _HomePageState extends State<HomePage> {
   /// registered in a previous session.
   Future<void> _init() async {
     // Restore locally cached history so chats are browsable offline before
-    // (or without) connecting to the hub.
-    unawaited(_client.loadLocalCache());
+    // (or without) connecting to the hub. Awaited (not fire-and-forget) so
+    // the room-name registry is in memory before auto-login pulls history —
+    // otherwise history-rebuilt conversations could win with roomId titles.
+    await _client.loadLocalCache();
     final settings = await ChatSettings.load();
     if (!mounted) return;
     _hostname.text = settings.hostname;

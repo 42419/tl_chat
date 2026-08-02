@@ -194,6 +194,12 @@ class ChatClient extends ChangeNotifier {
 
   /// nodeId -> hostname map, learned from presence + message senders.
   final Map<String, String> _names = {};
+
+  /// roomId -> display name, mirrored from `room/list` / `room/members` / acks
+  /// and persisted to the local [RoomNames] registry. Used to render real
+  /// group names immediately on re-login (even after clearing chat history)
+  /// without waiting for the network round-trip.
+  final Map<String, String> _roomNames = {};
   final List<String> _onlineNodes = [];
   final Map<String, Conversation> _conversations = {};
 
@@ -242,16 +248,28 @@ class ChatClient extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Loads locally cached conversations (offline browsing). Only fills gaps —
-  /// any conversation already in memory wins (fresh data beats stale cache).
+  /// Loads locally cached conversations (offline browsing) + the room-name
+  /// registry. Only fills gaps — any conversation already in memory wins
+  /// (fresh data beats stale cache). Best-effort: failures leave empty state.
   Future<void> loadLocalCache() async {
     try {
+      final cachedNames = await RoomNames.load();
       final cached = await ChatCache.loadAll();
       var added = false;
       for (final entry in cached.entries) {
         if (!_conversations.containsKey(entry.key)) {
           _conversations[entry.key] = entry.value;
           added = true;
+        }
+      }
+      // Room-name registry: mirror into memory, and patch room conversations
+      // whose title is still the raw room id (rebuilt from history or saved
+      // by a pre-registry session) with the locally-cached real name.
+      _roomNames.addAll(cachedNames);
+      for (final name in cachedNames.entries) {
+        final conv = _conversations[name.key];
+        if (conv != null && conv.isRoom && conv.title == name.key) {
+          conv.title = name.value;
         }
       }
       if (added) notifyListeners();
@@ -264,6 +282,8 @@ class ChatClient extends ChangeNotifier {
   /// authoritative copy is untouched; it is re-fetched on next connect.
   Future<void> clearLocalCache() async {
     _conversations.clear();
+    // 群名注册表不随聊天记录清除：它是元数据镜像，重登时仍能立即显示
+    // 真实群名（hub 才是权威来源，下次 room/list 会自动校准）。
     notifyListeners();
     await ChatCache.clear();
   }
@@ -271,6 +291,12 @@ class ChatClient extends ChangeNotifier {
   /// Persists a conversation to the local cache (best-effort, fire-and-forget).
   void _persist(Conversation conv) {
     unawaited(ChatCache.save(conv));
+  }
+
+  /// Persists the room-name registry (best-effort, fire-and-forget).
+  void _persistRoomNames() {
+    if (_roomNames.isEmpty) return;
+    unawaited(RoomNames.save(Map<String, String>.from(_roomNames)));
   }
 
   /// Connects to the hub over the tailnet. Requires [Tailscale.init] + [up]
@@ -404,15 +430,18 @@ class ChatClient extends ChangeNotifier {
 
   void _handleAck(ChatFrame frame) {
     final ok = frame.payload?['ok'] == true;
-    final roomId = frame.payload?['roomId'] as String?;
-
-    // Room acks (create/join/msg) all carry roomId. The `joined` marker
-    // distinguishes room/join — and must be handled BEFORE the generic !ok
-    // rejection below, otherwise a failed join (ok:false) would be swallowed
-    // by the connection-failure path and the joinRoom() waiter would hang.
+    final roomId = frame.payload?['roomId'] as String?;      // Room acks (create/join/msg) all carry roomId. The `joined` marker
+      // distinguishes room/join — and must be handled BEFORE the generic !ok
+      // rejection below, otherwise a failed join (ok:false) would be swallowed
+      // by the connection-failure path and the joinRoom() waiter would hang.
     if (roomId != null && frame.payload?['joined'] is bool) {
       // room/join ack — surface the result to the joinRoom() waiter.
       final joined = frame.payload?['joined'] == true;
+      final name = (frame.payload?['name'] as String?) ?? roomId;
+      if (name != roomId) {
+        _roomNames[roomId] = name;
+        _persistRoomNames();
+      }
       final waiter = _roomJoinCompleter;
       _roomJoinCompleter = null;
       if (waiter != null && !waiter.isCompleted) {
@@ -421,7 +450,7 @@ class ChatClient extends ChangeNotifier {
             roomId,
             () => Conversation(
               id: roomId,
-              title: (frame.payload?['name'] as String?) ?? roomId,
+              title: name,
               isRoom: true,
             ),
           );
@@ -450,6 +479,13 @@ class ChatClient extends ChangeNotifier {
 
     if (roomId != null) {
       // room/create or room/msg ack (both carry roomId, neither has `joined`).
+      // Mirror the authoritative room name into the registry + conversations
+      // so it survives cache clears and shows instantly on re-login.
+      final name = (frame.payload?['name'] as String?) ?? roomId;
+      if (name != roomId) {
+        _roomNames[roomId] = name;
+        _persistRoomNames();
+      }
       final createWaiter = _roomCreateCompleter;
       if (createWaiter != null && !createWaiter.isCompleted) {
         _roomCreateCompleter = null;
@@ -457,11 +493,7 @@ class ChatClient extends ChangeNotifier {
       }
       _conversations.putIfAbsent(
         roomId,
-        () => Conversation(
-          id: roomId,
-          title: (frame.payload?['name'] as String?) ?? roomId,
-          isRoom: true,
-        ),
+        () => Conversation(id: roomId, title: name, isRoom: true),
       );
     } else if (_helloAckCompleter != null && !_helloAckCompleter!.isCompleted) {
       _helloAckCompleter!.complete();
@@ -499,7 +531,7 @@ class ChatClient extends ChangeNotifier {
       threadId,
       () => Conversation(
         id: threadId,
-        title: roomId != null ? threadId : displayName(from),
+        title: roomId != null ? (_roomNames[roomId] ?? threadId) : displayName(from),
         isRoom: roomId != null,
       ),
     );
@@ -589,7 +621,7 @@ class ChatClient extends ChangeNotifier {
         threadId,
         () => Conversation(
           id: threadId,
-          title: roomId != null ? threadId : displayName(from),
+          title: roomId != null ? (_roomNames[roomId] ?? threadId) : displayName(from),
           isRoom: roomId != null,
         ),
       );
@@ -854,11 +886,17 @@ class ChatClient extends ChangeNotifier {
         isMember: map['isMember'] as bool? ?? false,
       );
     }).toList();
-    // Refresh room conversation titles when we learn their names.
+    // Mirror authoritative names into the registry + refresh conversation
+    // titles. Only overwrite titles that still carry the raw room id (a real
+    // user-facing name set locally wins until the hub says otherwise).
     for (final r in rooms) {
+      if (r.name.isNotEmpty) {
+        _roomNames[r.id] = r.name;
+      }
       final conv = _conversations[r.id];
       if (conv != null && conv.isRoom && conv.title == r.id) conv.title = r.name;
     }
+    _persistRoomNames();
     if (!completer.isCompleted) completer.complete(rooms);
   }
 
@@ -892,6 +930,11 @@ class ChatClient extends ChangeNotifier {
         online: map['online'] as bool? ?? false,
       );
     }).toList();
+    // Mirror the authoritative room name (hub truth) into the registry.
+    if (name.isNotEmpty && name != roomId) {
+      _roomNames[roomId] = name;
+      _persistRoomNames();
+    }
     final conv = _conversations[roomId];
     if (conv != null && conv.isRoom) conv.title = name;
     if (!completer.isCompleted) {
