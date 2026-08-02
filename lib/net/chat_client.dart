@@ -334,6 +334,9 @@ class ChatClient extends ChangeNotifier {
       );
 
       _connected = true;
+      // 群名不随历史消息下发：连接后主动拉一次群列表，让 _onRoomList 把
+      // 重建会话的标题从 roomId 修正为真实群名（清缓存重登后群名不再丢失）。
+      unawaited(listRooms().then<void>((_) {}, onError: (_) {}));
       _statusText = '已连接';
       _phase = ConnectionPhase.connected;
       _startHeartbeat();
