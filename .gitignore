@@ -44,5 +44,5 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
-# 内部开发计划，不推送到 GitHub
-PLAN.md
+# 内部开发计划与设计文档，不推送到 GitHub
+doc/
