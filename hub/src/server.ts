@@ -421,20 +421,52 @@ export class Hub {
     });
   }
 
+  // Phase 2.2 group read receipts. Two routing shapes:
+  //   1:1 (no roomId): forward to every session of `to` (the peer node) so
+  //     the peer's own messages flip to read. Payload carries `lastTs`.
+  //   room (roomId set): record the reader's per-room `max_read_seq` (GREATEST
+  //     guard against rollback, DESIGN §1.5 note 4) and fan out the merged
+  //     read state to EVERY member except the reader — so each member can
+  //     flip their own sent messages at seq ≤ maxReadSeq to read without a
+  //     per-message receipt storm (DESIGN §1.5: max_read_seq 合并上报).
+  //     `from` is the reader's nodeId; recipients use it to know WHO read.
   private onReadReceipt(session: Session, frame: ChatFrame): void {
     const reader = session.nodeId;
+    if (!reader) return;
+    const roomId = frame.roomId;
     const recipient = frame.to;
-    if (!reader || !recipient) return;
-    // Forward to every session of the recipient so read state (blue check)
-    // syncs across their devices.
-    for (const t of this.sessionsOf(recipient)) {
-      this.send(t, {
-        type: 'read',
-        from: reader,
-        to: recipient,
-        ts: frame.ts,
-        payload: frame.payload ?? {},
-      });
+    const ts = frame.ts ?? Date.now();
+
+    if (roomId) {
+      const seq = Number(frame.payload?.['maxReadSeq'] ?? 0);
+      if (seq > 0) {
+        this.store.upsertRoomReadSeq(roomId, reader, seq);
+      }
+      const payload = { ...frame.payload, maxReadSeq: seq };
+      for (const member of this.router.roomMembers(roomId)) {
+        if (member === reader) continue; // don't echo back to the reader
+        for (const t of this.sessionsOf(member)) {
+          this.send(t, {
+            type: 'read',
+            from: reader,
+            roomId,
+            ts,
+            payload,
+          });
+        }
+      }
+    } else if (recipient) {
+      // 1:1 read: forward to every session of the recipient so read state
+      // (blue check) syncs across their devices.
+      for (const t of this.sessionsOf(recipient)) {
+        this.send(t, {
+          type: 'read',
+          from: reader,
+          to: recipient,
+          ts,
+          payload: frame.payload ?? {},
+        });
+      }
     }
   }
 

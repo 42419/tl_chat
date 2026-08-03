@@ -953,10 +953,40 @@ class ChatClient extends ChangeNotifier {
   void _onReadReceipt(ChatFrame frame) {
     final from = frame.from;
     if (from == null) return;
+
+    if (frame.roomId != null) {
+      // Phase 2.2 group read receipt: `from` is the reader, `roomId` is the
+      // room. Flip OUR outgoing messages in that room with seq ≤ maxReadSeq
+      // to read. Only sent/delivered flip — an already-read message stays
+      // read (watermark never rolls back even if a late, lower-seq receipt
+      // arrives out of order).
+      if (from == _myNodeId) return; // ignore our own read echo
+      final conv = _conversations[frame.roomId];
+      if (conv == null || !conv.isRoom) return;
+      final maxReadSeq = (frame.payload?['maxReadSeq'] as num?)?.toInt();
+      if (maxReadSeq == null || maxReadSeq <= 0) return;
+      var changed = false;
+      for (var i = 0; i < conv.messages.length; i++) {
+        final m = conv.messages[i];
+        if (!m.isMine) continue;
+        final seq = m.seq;
+        if (seq == null || seq > maxReadSeq) continue;
+        if (m.status == MessageStatus.sent ||
+            m.status == MessageStatus.delivered) {
+          conv.messages[i] = m.copyWith(status: MessageStatus.read);
+          changed = true;
+        }
+      }
+      if (changed) {
+        _persist(conv);
+        notifyListeners();
+      }
+      return;
+    }
+
+    // 1:1 read receipt: `from` is the peer, they read up to `lastTs`.
     final conv = _conversations[from];
     if (conv == null) return;
-    // The peer tells us how far it has read; only flip our outgoing messages
-    // at or before that watermark to the blue double-check (read).
     final lastTs = (frame.payload?['lastTs'] as num?)?.toInt();
     var changed = false;
     for (var i = conv.messages.length - 1; i >= 0; i--) {
@@ -967,10 +997,12 @@ class ChatClient extends ChangeNotifier {
           m.status == MessageStatus.delivered) {
         conv.messages[i] = m.copyWith(status: MessageStatus.read);
         changed = true;
-        _persist(conv);
       }
     }
-    if (changed) notifyListeners();
+    if (changed) {
+      _persist(conv);
+      notifyListeners();
+    }
   }
 
   // ─── Phase 2.1 typing indicator ─────────────────────────────────────
@@ -1327,29 +1359,63 @@ class ChatClient extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Sends a `read` receipt to [conversationId]'s peer, carrying the ts of the
-  /// last incoming message so the peer can mark exactly those as read (blue
-  /// double-check). No-op for rooms (read receipts are 1:1 for now), the
-  /// self-conversation, or when there is nothing incoming to acknowledge.
+  /// Sends a `read` receipt for [conversationId], telling the peer(s) how far
+  /// we have read so they can flip their own outgoing messages to the blue
+  /// double-check (read).
+  ///
+  /// Two shapes (Phase 2.2):
+  ///   1:1 (conv.isRoom == false): sends `to: conversationId` with `lastTs`
+  ///     (the ts of the last incoming message) — the peer marks every message
+  ///     it sent at or before that ts as read.
+  ///   room (conv.isRoom == true): sends `roomId: conversationId` with
+  ///     `maxReadSeq` (the seq of the last incoming non-mine message). The
+  ///     hub records it in `room_read_seq` (GREATEST guard, no rollback) and
+  ///     fans out the merged read state to every other member, so each member
+  ///     flips their own sent messages at seq ≤ maxReadSeq to read — one
+  ///     receipt per read event, not a per-message storm (DESIGN §1.5).
+  ///
+  /// No-op for the self-conversation or when there is nothing incoming to ack.
   void sendReadReceipt(String conversationId) {
-    if (!_connected) return;
+    if (!_connected || _myNodeId == null) return;
     final conv = _conversations[conversationId];
-    if (conv == null || conv.isRoom) return;
+    if (conv == null) return;
     if (conversationId == _myNodeId) return;
-    int? lastIncomingTs;
-    for (final m in conv.messages) {
-      if (!m.isMine) lastIncomingTs = m.ts;
+
+    if (conv.isRoom) {
+      // Group read: report the highest seq among incoming (non-mine) messages.
+      int? maxReadSeq;
+      for (final m in conv.messages) {
+        if (!m.isMine && m.seq != null) {
+          maxReadSeq = m.seq;
+        }
+      }
+      if (maxReadSeq == null || maxReadSeq <= 0) return;
+      _write(
+        ChatFrame(
+          type: 'read',
+          from: _myNodeId,
+          roomId: conversationId,
+          ts: DateTime.now().millisecondsSinceEpoch,
+          payload: {'maxReadSeq': maxReadSeq},
+        ),
+      );
+    } else {
+      // 1:1 read: report the ts of the last incoming message.
+      int? lastIncomingTs;
+      for (final m in conv.messages) {
+        if (!m.isMine) lastIncomingTs = m.ts;
+      }
+      if (lastIncomingTs == null) return;
+      _write(
+        ChatFrame(
+          type: 'read',
+          from: _myNodeId,
+          to: conversationId,
+          ts: DateTime.now().millisecondsSinceEpoch,
+          payload: {'lastTs': lastIncomingTs},
+        ),
+      );
     }
-    if (lastIncomingTs == null) return;
-    _write(
-      ChatFrame(
-        type: 'read',
-        from: _myNodeId,
-        to: conversationId,
-        ts: DateTime.now().millisecondsSinceEpoch,
-        payload: {'lastTs': lastIncomingTs},
-      ),
-    );
   }
 
   void _onRoomList(ChatFrame frame) {

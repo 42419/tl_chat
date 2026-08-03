@@ -49,8 +49,51 @@ export class Store {
         ON messages(sender, recipient, id);
       CREATE INDEX IF NOT EXISTS idx_messages_room
         ON messages(room_id, id);
+      CREATE TABLE IF NOT EXISTS room_read_seq (
+        room_id TEXT NOT NULL,
+        member TEXT NOT NULL,
+        max_read_seq INTEGER NOT NULL,
+        PRIMARY KEY (room_id, member)
+      );
     `);
     this.migrateSeq();
+  }
+
+  // ─── Phase 2.2 group read receipts ──────────────────────────────────
+
+  /**
+   * Upserts a member's per-room read cursor, NEVER decreasing it (GREATEST
+   * guard against out-of-order / late receipts — DESIGN §4 note 4). Used by
+   * the server's onReadReceipt to record "this member has read up to seq N
+   * in this room" so other members can show the blue check on their own
+   * messages at seq ≤ N.
+   */
+  upsertRoomReadSeq(roomId: string, member: string, seq: number): void {
+    if (seq <= 0) return;
+    this.db
+      .prepare(
+        `INSERT INTO room_read_seq (room_id, member, max_read_seq) VALUES (?, ?, ?)
+         ON CONFLICT(room_id, member) DO UPDATE SET
+           max_read_seq = MAX(max_read_seq, excluded.max_read_seq)`,
+      )
+      .run(roomId, member, seq);
+  }
+
+  /**
+   * Returns every member's read cursor for a room, EXCLUDING [except]. Used
+   * to fan out the merged read state to all other members so each one's own
+   * sent bubbles flip to "read" at the right watermark without a per-message
+   * receipt storm (DESIGN §1.5: max_read_seq 合并上报).
+   */
+  roomReadSeqs(roomId: string, except?: string): { member: string; seq: number }[] {
+    const sql = except
+      ? 'SELECT member, max_read_seq AS seq FROM room_read_seq WHERE room_id = ? AND member != ?'
+      : 'SELECT member, max_read_seq AS seq FROM room_read_seq WHERE room_id = ?';
+    const rows = (this.db.prepare(sql).all(...(except ? [roomId, except] : [roomId])) as unknown[]) as {
+      member: string;
+      seq: number;
+    }[];
+    return rows.map((r) => ({ member: r.member, seq: Number(r.seq) }));
   }
 
   /**

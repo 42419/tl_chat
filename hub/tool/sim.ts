@@ -578,6 +578,136 @@ async function main(): Promise<void> {
     bPhone.close();
     c.close();
     d.close();
+
+    // Phase 2.2: group read receipts. A reader sends `read {roomId, maxReadSeq}`
+    // to report how far it has read. The hub must:
+    //   (1) persist max_read_seq for the reader (GREATEST guard, no rollback),
+    //   (2) fan out the read state to every OTHER member (not back to reader),
+    //   (3) do it as ONE broadcast per read event — not a per-message receipt
+    //       storm (O(members) frames, not O(members × messages)).
+    const r1 = new SimClient(port, 'node-r1', 'r1-pc');
+    const r2 = new SimClient(port, 'node-r2', 'r2-pc');
+    const r3 = new SimClient(port, 'node-r3', 'r3-pc');
+    await r1.hello();
+    await r2.hello();
+    await r3.hello();
+
+    // Create a 3-member room.
+    r1.send({ type: 'room/create', from: 'node-r1', payload: { name: 'read-room' } });
+    const readRoomAck = await r1.waitFor(
+      (fr) => fr.type === 'ack' && fr.payload?.['ok'] === true && Boolean(fr.payload?.['roomId']),
+    );
+    const readRoomId = readRoomAck.payload?.['roomId'] as string;
+    for (const who of [r2, r3]) {
+      who.send({ type: 'room/join', from: who.nodeId, roomId: readRoomId });
+      await who.waitFor((fr) => fr.type === 'ack' && fr.payload?.['joined'] === true);
+    }
+
+    // r1 sends two room messages; capture their seq from the acks.
+    r1.send({
+      type: 'room/msg',
+      from: 'node-r1',
+      roomId: readRoomId,
+      ts: 1735000000100,
+      payload: { text: 'rm1', clientMessageId: 'c-rm1' },
+    });
+    const rm1Ack = await r1.waitFor(
+      (fr) => fr.type === 'ack' && fr.payload?.['clientMessageId'] === 'c-rm1',
+    );
+    const rm1Seq = rm1Ack.payload?.['seq'] as number;
+    r1.send({
+      type: 'room/msg',
+      from: 'node-r1',
+      roomId: readRoomId,
+      ts: 1735000000101,
+      payload: { text: 'rm2', clientMessageId: 'c-rm2' },
+    });
+    const rm2Ack = await r1.waitFor(
+      (fr) => fr.type === 'ack' && fr.payload?.['clientMessageId'] === 'c-rm2',
+    );
+    const rm2Seq = rm2Ack.payload?.['seq'] as number;
+    // r2 + r3 receive both messages.
+    await r2.waitFor((fr) => fr.type === 'room/msg' && fr.payload?.['text'] === 'rm1');
+    await r2.waitFor((fr) => fr.type === 'room/msg' && fr.payload?.['text'] === 'rm2');
+    await r3.waitFor((fr) => fr.type === 'room/msg' && fr.payload?.['text'] === 'rm1');
+    await r3.waitFor((fr) => fr.type === 'room/msg' && fr.payload?.['text'] === 'rm2');
+
+    // r2 reports it has read up to rm2's seq. r1 AND r3 must each receive
+    // exactly ONE `read` frame (from=r2, roomId, maxReadSeq=rm2Seq). r2 must
+    // NOT receive its own read echo. This is the anti-storm guarantee: one
+    // read event -> N-1 frames, not one per message.
+    r2.send({
+      type: 'read',
+      from: 'node-r2',
+      roomId: readRoomId,
+      ts: 1735000000200,
+      payload: { maxReadSeq: rm2Seq },
+    });
+    const r1Read = await r1.waitFor(
+      (fr) => fr.type === 'read' && fr.from === 'node-r2' && fr.roomId === readRoomId,
+    );
+    const r3Read = await r3.waitFor(
+      (fr) => fr.type === 'read' && fr.from === 'node-r2' && fr.roomId === readRoomId,
+    );
+    assert(
+      r1Read.payload?.['maxReadSeq'] === rm2Seq,
+      'r1 received group read receipt with correct maxReadSeq',
+    );
+    assert(
+      r3Read.payload?.['maxReadSeq'] === rm2Seq,
+      'r3 received group read receipt with correct maxReadSeq',
+    );
+    // Give r2 a moment — if the hub had echoed back, r2 would have a read
+    // frame in its inbox. Assert it does NOT.
+    await sleep(150);
+    const r2Echo = r2.inbox.filter(
+      (fr) => fr.type === 'read' && fr.from === 'node-r2',
+    ).length;
+    assert(r2Echo === 0, 'group read NOT echoed back to the reader');
+    console.log('  ✓ group read receipt fanned out to all members except reader');
+
+    // Anti-storm: the one read frame was consumed by waitFor above. If the
+    // hub had fanned out one-per-message (storm), EXTRA read frames would
+    // now be sitting in r1's inbox. Assert there are NONE — one read event
+    // produced exactly one broadcast, not one per message covered.
+    await sleep(150);
+    const r1Extra = r1.inbox.filter(
+      (fr) => fr.type === 'read' && fr.from === 'node-r2' && fr.roomId === readRoomId,
+    ).length;
+    assert(
+      r1Extra === 0,
+      `anti-storm: no extra read frames beyond the one consumed (got ${r1Extra})`,
+    );
+    console.log('  ✓ anti-storm: one read event = one broadcast (not per-message)');
+
+    // r2 reads again with a LOWER seq (out-of-order / late receipt). The hub
+    // still fans it out (carrying the lower maxReadSeq) — the client-side
+    // watermark guard (only flip sent->read, never read->sent) prevents the
+    // already-read messages from rolling back. This verifies the late/lower
+    // path doesn't crash and the frame carries the reported value as-is.
+    r2.send({
+      type: 'read',
+      from: 'node-r2',
+      roomId: readRoomId,
+      ts: 1735000000201,
+      payload: { maxReadSeq: rm1Seq }, // lower than rm2Seq
+    });
+    const r1Late = await r1.waitFor(
+      (fr) =>
+        fr.type === 'read' &&
+        fr.from === 'node-r2' &&
+        fr.roomId === readRoomId &&
+        fr.payload?.['maxReadSeq'] === rm1Seq,
+    );
+    assert(
+      r1Late.payload?.['maxReadSeq'] === rm1Seq,
+      'late lower-seq read fanned out with the reported (lower) value',
+    );
+    console.log('  ✓ late lower-seq read receipt fanned out (client guards rollback)');
+
+    r1.close();
+    r2.close();
+    r3.close();
     console.log('\nALL SIM CHECKS PASSED ✓');
   } finally {
     await hub.stop();
