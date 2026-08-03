@@ -98,6 +98,10 @@ class Conversation {
   /// Not persisted (transient per-session state).
   int unread = 0;
 
+  /// Pinned to the top of the conversation list. Persisted locally; the hub
+  /// is not involved (it is a per-device preference).
+  bool pinned = false;
+
   String get lastPreview => lastMessage?.text ?? '';
   int get lastTs => lastMessage?.ts ?? 0;
 
@@ -105,6 +109,7 @@ class Conversation {
     'id': id,
     'title': title,
     'isRoom': isRoom,
+    'pinned': pinned,
     'messages': messages.map((m) => m.toJson()).toList(),
   };
 
@@ -114,6 +119,7 @@ class Conversation {
       title: json['title'] as String? ?? '',
       isRoom: json['isRoom'] as bool? ?? false,
     );
+    conv.pinned = json['pinned'] as bool? ?? false;
     for (final raw in (json['messages'] as List? ?? const [])) {
       if (raw is! Map) continue;
       final msg = ChatMessage.fromJson(Map<String, dynamic>.from(raw));
@@ -150,7 +156,11 @@ class RoomMember {
 
 /// Group room details returned by `room/members`.
 class RoomInfo {
-  const RoomInfo({required this.roomId, required this.name, required this.members});
+  const RoomInfo({
+    required this.roomId,
+    required this.name,
+    required this.members,
+  });
 
   final String roomId;
   final String name;
@@ -170,7 +180,8 @@ class HubException implements Exception {
 enum ConnectionPhase { unconnected, connecting, connected, failed }
 
 class ChatClient extends ChangeNotifier {
-  ChatClient({Tailscale? tailscale}) : _tailscale = tailscale ?? Tailscale.instance;
+  ChatClient({Tailscale? tailscale})
+    : _tailscale = tailscale ?? Tailscale.instance;
 
   final Tailscale _tailscale;
   TailscaleConnection? _conn;
@@ -246,6 +257,50 @@ class ChatClient extends ChangeNotifier {
     if (conv == null || conv.unread == 0) return;
     conv.unread = 0;
     notifyListeners();
+  }
+
+  /// Toggles the pinned-to-top flag of a conversation (per-device preference,
+  /// persisted in the local cache; the hub is not involved).
+  void togglePinned(String conversationId) {
+    final conv = _conversations[conversationId];
+    if (conv == null) return;
+    conv.pinned = !conv.pinned;
+    _persist(conv);
+    notifyListeners();
+  }
+
+  /// Removes a conversation locally (list + cache file) and asks the hub to
+  /// clear its history so it does not resurrect on the next reconnect.
+  Future<void> deleteConversation(String conversationId) async {
+    final conv = _conversations.remove(conversationId);
+    if (conv == null) return;
+    await ChatCache.deleteOne(conversationId);
+    if (_connected && _myNodeId != null) {
+      _write(
+        conv.isRoom
+            ? ChatFrame(
+                type: 'conv/clear',
+                from: _myNodeId,
+                roomId: conversationId,
+              )
+            : ChatFrame(
+                type: 'conv/clear',
+                from: _myNodeId,
+                to: conversationId,
+              ),
+      );
+    }
+    notifyListeners();
+  }
+
+  /// Re-syncs with the hub: re-pulls history (dedup makes it idempotent) and
+  /// refreshes the room list. Used by pull-to-refresh on the conversation list.
+  Future<void> refresh() async {
+    if (!_connected || _myNodeId == null) return;
+    _write(
+      ChatFrame(type: 'offline', from: _myNodeId, payload: {'limit': 200}),
+    );
+    await listRooms().then<void>((_) {}, onError: (_) {});
   }
 
   /// Loads locally cached conversations (offline browsing) + the room-name
@@ -430,10 +485,15 @@ class ChatClient extends ChangeNotifier {
 
   void _handleAck(ChatFrame frame) {
     final ok = frame.payload?['ok'] == true;
-    final roomId = frame.payload?['roomId'] as String?;      // Room acks (create/join/msg) all carry roomId. The `joined` marker
-      // distinguishes room/join — and must be handled BEFORE the generic !ok
-      // rejection below, otherwise a failed join (ok:false) would be swallowed
-      // by the connection-failure path and the joinRoom() waiter would hang.
+    // conv/clear ack — history deletion confirmed; nothing else to do (the
+    // generic path below would otherwise flip every `sending` message to sent).
+    if (frame.payload?['cleared'] != null) return;
+    final roomId =
+        frame.payload?['roomId']
+            as String?; // Room acks (create/join/msg) all carry roomId. The `joined` marker
+    // distinguishes room/join — and must be handled BEFORE the generic !ok
+    // rejection below, otherwise a failed join (ok:false) would be swallowed
+    // by the connection-failure path and the joinRoom() waiter would hang.
     if (roomId != null && frame.payload?['joined'] is bool) {
       // room/join ack — surface the result to the joinRoom() waiter.
       final joined = frame.payload?['joined'] == true;
@@ -448,11 +508,7 @@ class ChatClient extends ChangeNotifier {
         if (joined) {
           _conversations.putIfAbsent(
             roomId,
-            () => Conversation(
-              id: roomId,
-              title: name,
-              isRoom: true,
-            ),
+            () => Conversation(id: roomId, title: name, isRoom: true),
           );
           waiter.complete(true);
         } else {
@@ -531,7 +587,9 @@ class ChatClient extends ChangeNotifier {
       threadId,
       () => Conversation(
         id: threadId,
-        title: roomId != null ? (_roomNames[roomId] ?? threadId) : displayName(from),
+        title: roomId != null
+            ? (_roomNames[roomId] ?? threadId)
+            : displayName(from),
         isRoom: roomId != null,
       ),
     );
@@ -621,7 +679,9 @@ class ChatClient extends ChangeNotifier {
         threadId,
         () => Conversation(
           id: threadId,
-          title: roomId != null ? (_roomNames[roomId] ?? threadId) : displayName(from),
+          title: roomId != null
+              ? (_roomNames[roomId] ?? threadId)
+              : displayName(from),
           isRoom: roomId != null,
         ),
       );
@@ -750,11 +810,7 @@ class ChatClient extends ChangeNotifier {
     final completer = Completer<String>();
     _roomCreateCompleter = completer;
     _write(
-      ChatFrame(
-        type: 'room/create',
-        from: _myNodeId,
-        payload: {'name': name},
-      ),
+      ChatFrame(type: 'room/create', from: _myNodeId, payload: {'name': name}),
     );
     return completer.future.timeout(
       const Duration(seconds: 10),
@@ -894,7 +950,9 @@ class ChatClient extends ChangeNotifier {
         _roomNames[r.id] = r.name;
       }
       final conv = _conversations[r.id];
-      if (conv != null && conv.isRoom && conv.title == r.id) conv.title = r.name;
+      if (conv != null && conv.isRoom && conv.title == r.id) {
+        conv.title = r.name;
+      }
     }
     _persistRoomNames();
     if (!completer.isCompleted) completer.complete(rooms);
@@ -938,7 +996,9 @@ class ChatClient extends ChangeNotifier {
     final conv = _conversations[roomId];
     if (conv != null && conv.isRoom) conv.title = name;
     if (!completer.isCompleted) {
-      completer.complete(RoomInfo(roomId: roomId, name: name, members: members));
+      completer.complete(
+        RoomInfo(roomId: roomId, name: name, members: members),
+      );
     }
   }
 

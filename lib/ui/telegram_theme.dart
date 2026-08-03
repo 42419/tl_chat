@@ -19,6 +19,9 @@ abstract final class Tg {
   // ─── Dark theme ─────────────────────────────────────────────────────
   static const darkChatBg = Color(0xff0e1621);
   static const darkPanel = Color(0xff17212b);
+  static const darkElevated = Color(
+    0xff1c2733,
+  ); // one step up from panel (sheets/dialogs)
   static const darkIncoming = Color(0xff182533);
   static const darkOutgoing = Color(0xff2b5278);
   static const darkText = Color(0xfff5f5f5);
@@ -61,6 +64,7 @@ class TgPalette {
 
   Color get chatBg => dark ? Tg.darkChatBg : Tg.lightChatBg;
   Color get panel => dark ? Tg.darkPanel : Tg.lightPanel;
+  Color get elevated => dark ? Tg.darkElevated : Tg.lightPanel;
   Color get incoming => dark ? Tg.darkIncoming : Tg.lightIncoming;
   Color get outgoing => dark ? Tg.darkOutgoing : Tg.lightOutgoing;
   Color get text => dark ? Tg.darkText : Tg.lightText;
@@ -175,16 +179,8 @@ ThemeData _buildTheme({required bool dark}) {
         fontWeight: FontWeight.w600,
         color: palette.text,
       ),
-      bodyMedium: TextStyle(
-        fontSize: 15,
-        height: 1.4,
-        color: palette.text,
-      ),
-      bodySmall: TextStyle(
-        fontSize: 13,
-        height: 1.4,
-        color: palette.subtext,
-      ),
+      bodyMedium: TextStyle(fontSize: 15, height: 1.4, color: palette.text),
+      bodySmall: TextStyle(fontSize: 13, height: 1.4, color: palette.subtext),
       labelMedium: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
       labelSmall: const TextStyle(fontSize: 12, letterSpacing: 0.2),
     ),
@@ -227,16 +223,29 @@ ThemeData _buildTheme({required bool dark}) {
         disabledForegroundColor: Colors.white70,
         minimumSize: const Size(64, 44),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        textStyle: const TextStyle(
-          fontSize: 15,
-          fontWeight: FontWeight.w600,
-        ),
+        textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
       ),
     ),
     dividerTheme: DividerThemeData(
       color: palette.hairline,
       thickness: 0.6,
       space: 0.6,
+    ),
+    bottomSheetTheme: BottomSheetThemeData(
+      backgroundColor: palette.elevated,
+      surfaceTintColor: Colors.transparent,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+    ),
+    dialogTheme: DialogThemeData(
+      backgroundColor: palette.elevated,
+      surfaceTintColor: Colors.transparent,
+    ),
+    snackBarTheme: SnackBarThemeData(
+      backgroundColor: dark ? const Color(0xff2b3949) : const Color(0xff333333),
+      contentTextStyle: const TextStyle(color: Colors.white),
+      behavior: SnackBarBehavior.floating,
     ),
   );
 }

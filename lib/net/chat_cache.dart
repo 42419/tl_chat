@@ -37,9 +37,7 @@ class ChatCache {
         try {
           final json = jsonDecode(await entry.readAsString());
           if (json is! Map) continue;
-          final conv = Conversation.fromJson(
-            Map<String, dynamic>.from(json),
-          );
+          final conv = Conversation.fromJson(Map<String, dynamic>.from(json));
           out[conv.id] = conv;
         } catch (_) {
           // skip corrupt file
@@ -59,6 +57,21 @@ class ChatCache {
       await file.writeAsString(jsonEncode(conv.toJson()));
     } catch (_) {
       // best-effort: never break chat because the cache failed
+    }
+  }
+
+  /// Deletes one conversation's cache file (used when a conversation is
+  /// removed from the list). Best-effort: missing file / platform errors are
+  /// swallowed.
+  static Future<void> deleteOne(String id) async {
+    try {
+      final dir = await _dir();
+      final file = File(p.join(dir.path, _fileName(id)));
+      if (file.existsSync()) {
+        await file.delete();
+      }
+    } catch (_) {
+      // best-effort
     }
   }
 

@@ -142,6 +142,27 @@ export class Store {
     return rows.reverse().map((row) => this.rowToMessage(row));
   }
 
+  /**
+   * Deletes an entire conversation's history from the authoritative store:
+   * for 1:1 both directions (room_id IS NULL), or every message of a room.
+   * Queued (delivered=0) rows are rows in the same table, so clearing a
+   * conversation also drops its offline queue — a deleted chat stays gone.
+   */
+  clearConversation(peerA: string, peerB: string | null, roomId: string | null): void {
+    if (roomId) {
+      this.db
+        .prepare('DELETE FROM messages WHERE room_id = ? AND recipient = ?')
+        .run(roomId, roomId);
+    } else if (peerB) {
+      this.db
+        .prepare(
+          `DELETE FROM messages WHERE room_id IS NULL
+           AND ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))`,
+        )
+        .run(peerA, peerB, peerB, peerA);
+    }
+  }
+
   // ─── room membership (cross-restart recovery) ──────────────────────
 
   /** Upserts a room's metadata + membership. */

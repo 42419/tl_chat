@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:tailscale/tailscale.dart';
@@ -34,9 +35,12 @@ class _ChatAppState extends State<ChatApp> {
       theme: telegramLightTheme(),
       darkTheme: telegramDarkTheme(),
       themeMode: _dark ? ThemeMode.dark : ThemeMode.light,
-      home: HomePage(dark: _dark, onToggleTheme: () {
-        setState(() => _dark = !_dark);
-      }),
+      home: HomePage(
+        dark: _dark,
+        onToggleTheme: () {
+          setState(() => _dark = !_dark);
+        },
+      ),
     );
   }
 }
@@ -313,7 +317,7 @@ class _HomePageState extends State<HomePage> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        backgroundColor: TgPalette.of(context).panel,
+        backgroundColor: TgPalette.of(context).elevated,
         title: const Text('清除本地缓存？'),
         content: const Text('将删除本机缓存的聊天记录（不影响 Hub 上的服务器记录，重新连接后会自动恢复）。'),
         actions: [
@@ -331,9 +335,9 @@ class _HomePageState extends State<HomePage> {
     if (confirmed != true) return;
     await _client.clearLocalCache();
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('本地缓存已清除')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('本地缓存已清除')));
     }
   }
 
@@ -365,7 +369,9 @@ class _HomePageState extends State<HomePage> {
           IconButton(
             onPressed: widget.onToggleTheme,
             icon: Icon(
-              widget.dark ? Icons.light_mode_outlined : Icons.dark_mode_outlined,
+              widget.dark
+                  ? Icons.light_mode_outlined
+                  : Icons.dark_mode_outlined,
             ),
             tooltip: '切换主题',
           ),
@@ -382,27 +388,41 @@ class _HomePageState extends State<HomePage> {
         child: AnimatedBuilder(
           animation: _client,
           builder: (context, _) {
+            // First launch / auto-login with no cached history: show a
+            // skeleton instead of a blank connect panel.
+            if (_client.phase == ConnectionPhase.connecting && !_showPanel) {
+              return const _SkeletonConversationList();
+            }
             // Offline browsing: show cached conversations even when not
             // connected (they were restored from the local cache). The connect
             // panel shows inline when there is nothing cached yet or when the
             // user explicitly chose 去连接 from the offline banner.
-            if (_client.connected || (_client.conversations.isNotEmpty && !_showPanel)) {
+            if (_client.connected ||
+                (_client.conversations.isNotEmpty && !_showPanel)) {
               return _conversationList(context);
             }
             return _connectPanel(theme);
           },
         ),
       ),
-      floatingActionButton: _client.connected
-          ? FloatingActionButton(
-              onPressed: _newChatSheet,
-              backgroundColor: Tg.blue,
-              foregroundColor: Colors.white,
-              shape: const CircleBorder(),
-              tooltip: '新建会话',
-              child: const Icon(Icons.edit, size: 22),
-            )
-          : null,
+      floatingActionButton: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 250),
+        transitionBuilder: (child, anim) => ScaleTransition(
+          scale: CurvedAnimation(parent: anim, curve: Curves.easeOutBack),
+          child: child,
+        ),
+        child: _client.connected
+            ? FloatingActionButton(
+                key: const ValueKey('fab-connected'),
+                onPressed: _newChatSheet,
+                backgroundColor: Tg.blue,
+                foregroundColor: Colors.white,
+                shape: const CircleBorder(),
+                tooltip: '新建会话',
+                child: const Icon(Icons.edit, size: 22),
+              )
+            : const SizedBox.shrink(key: ValueKey('fab-hidden')),
+      ),
     );
   }
 
@@ -412,7 +432,7 @@ class _HomePageState extends State<HomePage> {
     final palette = TgPalette.of(context);
     showModalBottomSheet<void>(
       context: context,
-      backgroundColor: palette.panel,
+      backgroundColor: palette.elevated,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
       ),
@@ -451,9 +471,9 @@ class _HomePageState extends State<HomePage> {
                 padding: const EdgeInsets.all(16),
                 child: Text(
                   '暂无在线节点',
-                  style: Theme.of(sheetContext).textTheme.bodySmall?.copyWith(
-                    color: palette.subtext,
-                  ),
+                  style: Theme.of(
+                    sheetContext,
+                  ).textTheme.bodySmall?.copyWith(color: palette.subtext),
                 ),
               )
             else
@@ -547,7 +567,11 @@ class _HomePageState extends State<HomePage> {
                     shape: BoxShape.circle,
                   ),
                   alignment: Alignment.center,
-                  child: const Icon(Icons.hub_outlined, size: 36, color: Tg.blue),
+                  child: const Icon(
+                    Icons.hub_outlined,
+                    size: 36,
+                    color: Tg.blue,
+                  ),
                 ),
               ),
               const SizedBox(height: 16),
@@ -604,9 +628,7 @@ class _HomePageState extends State<HomePage> {
                 const SizedBox(height: 14),
                 Text(
                   _client.lastError!,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: Tg.error,
-                  ),
+                  style: theme.textTheme.bodySmall?.copyWith(color: Tg.error),
                 ),
               ],
               const SizedBox(height: 8),
@@ -633,8 +655,9 @@ class _HomePageState extends State<HomePage> {
               SizedBox(
                 width: double.infinity,
                 child: FilledButton.icon(
-                  onPressed:
-                      _tailscaleReady && !_client.connected ? _connect : null,
+                  onPressed: _tailscaleReady && !_client.connected
+                      ? _connect
+                      : null,
                   icon: const Icon(Icons.link, size: 18),
                   label: const Text('连接'),
                 ),
@@ -652,7 +675,11 @@ class _HomePageState extends State<HomePage> {
     final theme = Theme.of(context);
     final palette = TgPalette.of(context);
     final conversations = _client.conversations.toList()
-      ..sort((a, b) => b.lastTs.compareTo(a.lastTs));
+      ..sort((a, b) {
+        // Pinned conversations float to the top; the rest by recency.
+        if (a.pinned != b.pinned) return a.pinned ? -1 : 1;
+        return b.lastTs.compareTo(a.lastTs);
+      });
     final query = _searchQuery.trim().toLowerCase();
     final filtered = query.isEmpty
         ? conversations
@@ -685,17 +712,14 @@ class _HomePageState extends State<HomePage> {
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        _autoLoginInFlight
-                            ? '正在自动连接…'
-                            : '离线模式：显示本地缓存记录',
+                        _autoLoginInFlight ? '正在自动连接…' : '离线模式：显示本地缓存记录',
                         style: theme.textTheme.bodySmall?.copyWith(
                           color: palette.subtext,
                         ),
                       ),
                     ),
                     TextButton(
-                      onPressed:
-                          _autoLoginInFlight ? null : _showConnectPanel,
+                      onPressed: _autoLoginInFlight ? null : _showConnectPanel,
                       child: Text(_autoLoginInFlight ? '连接中' : '去连接'),
                     ),
                   ],
@@ -732,39 +756,54 @@ class _HomePageState extends State<HomePage> {
         ),
         // Online nodes strip
         if (_client.onlineNodes.isNotEmpty) _onlineStrip(context),
-        // Conversation list
+        // Conversation list (pull-to-refresh: re-sync when connected, else
+        // retry connecting; swipe actions on each tile via Slidable).
         Expanded(
-          child: filtered.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.forum_outlined,
-                        size: 46,
-                        color: palette.subtext.withValues(alpha: 0.6),
-                      ),
-                      const SizedBox(height: 10),
-                      Text(
-                        query.isEmpty
-                            ? '暂无会话\n点击右上角新建群聊，或从在线节点发起私聊'
-                            : '没有匹配的会话',
-                        textAlign: TextAlign.center,
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          color: palette.subtext,
+          child: RefreshIndicator(
+            onRefresh: () => _client.connected ? _client.refresh() : _connect(),
+            child: filtered.isEmpty
+                ? LayoutBuilder(
+                    builder: (context, constraints) => SingleChildScrollView(
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      child: SizedBox(
+                        height: constraints.maxHeight,
+                        child: Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.forum_outlined,
+                                size: 46,
+                                color: palette.subtext.withValues(alpha: 0.6),
+                              ),
+                              const SizedBox(height: 10),
+                              Text(
+                                query.isEmpty
+                                    ? '暂无会话\n点击右上角新建群聊，或从在线节点发起私聊'
+                                    : '没有匹配的会话',
+                                textAlign: TextAlign.center,
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: palette.subtext,
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
-                    ],
+                    ),
+                  )
+                : SlidableAutoCloseBehavior(
+                    child: ListView.builder(
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      padding: const EdgeInsets.only(bottom: 8),
+                      itemCount: filtered.length,
+                      itemBuilder: (context, i) {
+                        final conv = filtered[i];
+                        return _conversationTile(context, conv);
+                      },
+                    ),
                   ),
-                )
-              : ListView.builder(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  itemCount: filtered.length,
-                  itemBuilder: (context, i) {
-                    final conv = filtered[i];
-                    return _conversationTile(context, conv);
-                  },
-                ),
+          ),
         ),
       ],
     );
@@ -813,115 +852,198 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-
-
   Widget _conversationTile(BuildContext context, Conversation conv) {
     final theme = Theme.of(context);
     final palette = TgPalette.of(context);
     final online = !conv.isRoom && _client.onlineNodes.contains(conv.id);
     final isMine = conv.id == _client.myNodeId;
 
-    return InkWell(
-      onTap: () => _openChat(conv.id, isRoom: conv.isRoom),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-        child: Row(
-          children: [
-            TgAvatar(
-              id: conv.id,
-              size: 54,
-              title: conv.title,
-              online: online,
-              isRoom: conv.isRoom,
+    return Slidable(
+      key: ValueKey('slidable-${conv.id}'),
+      endActionPane: ActionPane(
+        motion: const ScrollMotion(),
+        extentRatio: 0.62,
+        children: [
+          SlidableAction(
+            onPressed: (_) => _client.togglePinned(conv.id),
+            backgroundColor: Tg.blue,
+            foregroundColor: Colors.white,
+            icon: conv.pinned ? Icons.push_pin_outlined : Icons.push_pin,
+            label: conv.pinned ? '取消置顶' : '置顶',
+          ),
+          // 已读 only makes sense when there is something unread; the list
+          // rebuilds on every notifyListeners so this stays live.
+          if (conv.unread > 0)
+            SlidableAction(
+              onPressed: (_) => _client.markConversationRead(conv.id),
+              backgroundColor: Tg.online,
+              foregroundColor: Colors.white,
+              icon: Icons.done_all,
+              label: '已读',
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          conv.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: theme.textTheme.titleMedium?.copyWith(
-                            fontWeight: FontWeight.w600,
-                            fontSize: 16,
+          SlidableAction(
+            onPressed: (_) => _confirmDeleteConversation(context, conv),
+            backgroundColor: Tg.error,
+            foregroundColor: Colors.white,
+            icon: Icons.delete,
+            label: '删除',
+          ),
+        ],
+      ),
+      child: InkWell(
+        onTap: () => _openChat(conv.id, isRoom: conv.isRoom),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+          child: Row(
+            children: [
+              // NOTE: no Hero here — a hero flight from this list crashed with
+              // MultiChildRenderObjectElement.forgetChild (`_children.contains`)
+              // whenever the list rebuilt (any notifyListeners) mid-flight. The
+              // chat page uses a safe fade+slide PageRouteBuilder transition.
+              TgAvatar(
+                id: conv.id,
+                size: 54,
+                title: conv.title,
+                online: online,
+                isRoom: conv.isRoom,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        if (conv.pinned) ...[
+                          const Padding(
+                            padding: EdgeInsets.only(right: 5),
+                            child: Icon(
+                              Icons.push_pin,
+                              size: 13,
+                              color: Tg.blue,
+                            ),
                           ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        _tileTime(conv.lastTs),
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          fontSize: 13,
-                          color: conv.unread > 0
-                              ? Tg.blue
-                              : palette.subtext,
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 3),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          conv.lastPreview.isEmpty
-                              ? '暂无消息'
-                              : conv.lastPreview,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            fontSize: 14,
-                            color: conv.unread > 0
-                                ? palette.text
-                                : palette.subtext,
-                            fontWeight: conv.unread > 0
-                                ? FontWeight.w500
-                                : FontWeight.w400,
-                          ),
-                        ),
-                      ),
-                      if (conv.unread > 0) ...[
-                        const SizedBox(width: 8),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 7,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Tg.blue,
-                            borderRadius: BorderRadius.circular(9999),
-                          ),
-                          constraints: const BoxConstraints(minWidth: 20),
-                          alignment: Alignment.center,
+                        ],
+                        Expanded(
                           child: Text(
-                            conv.unread > 99 ? '99+' : '${conv.unread}',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 12,
+                            conv.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.titleMedium?.copyWith(
                               fontWeight: FontWeight.w600,
+                              fontSize: 16,
                             ),
                           ),
                         ),
-                      ] else if (isMine && conv.messages.isNotEmpty)
-                        Icon(
-                          Icons.done_all,
-                          size: 16,
-                          color: Tg.sent.withValues(alpha: 0.7),
+                        const SizedBox(width: 8),
+                        Text(
+                          _tileTime(conv.lastTs),
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            fontSize: 13,
+                            color: conv.unread > 0 ? Tg.blue : palette.subtext,
+                          ),
                         ),
-                    ],
-                  ),
-                ],
+                      ],
+                    ),
+                    const SizedBox(height: 3),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            conv.lastPreview.isEmpty
+                                ? '暂无消息'
+                                : conv.lastPreview,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              fontSize: 14,
+                              color: conv.unread > 0
+                                  ? palette.text
+                                  : palette.subtext,
+                              fontWeight: conv.unread > 0
+                                  ? FontWeight.w500
+                                  : FontWeight.w400,
+                            ),
+                          ),
+                        ),
+                        if (conv.unread > 0) ...[
+                          const SizedBox(width: 8),
+                          // Elastic pop when the unread count changes.
+                          TweenAnimationBuilder<double>(
+                            key: ValueKey('unread-${conv.id}-${conv.unread}'),
+                            tween: Tween(begin: 0.4, end: 1),
+                            duration: const Duration(milliseconds: 380),
+                            curve: Curves.elasticOut,
+                            builder: (context, scale, child) =>
+                                Transform.scale(scale: scale, child: child),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 7,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Tg.blue,
+                                borderRadius: BorderRadius.circular(9999),
+                              ),
+                              constraints: const BoxConstraints(minWidth: 20),
+                              alignment: Alignment.center,
+                              child: Text(
+                                conv.unread > 99 ? '99+' : '${conv.unread}',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ] else if (isMine && conv.messages.isNotEmpty)
+                          Icon(
+                            Icons.done_all,
+                            size: 16,
+                            color: Tg.sent.withValues(alpha: 0.7),
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
+  }
+
+  /// Confirms deletion with the user, then removes the conversation locally
+  /// and clears its history on the hub (both sides lose the messages).
+  Future<void> _confirmDeleteConversation(
+    BuildContext context,
+    Conversation conv,
+  ) async {
+    final palette = TgPalette.of(context);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: palette.elevated,
+        title: Text('删除「${conv.title}」？'),
+        content: const Text('将清空双方的聊天记录，且无法恢复。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Tg.error),
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await _client.deleteConversation(conv.id);
+    }
   }
 
   String _tileTime(int ts) {
@@ -946,14 +1068,16 @@ class _HomePageState extends State<HomePage> {
       rooms = await _client.listRooms();
     } on HubException catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.message)));
       }
       return;
     }
     if (!mounted) return;
     showModalBottomSheet<void>(
       context: context,
-      backgroundColor: palette.panel,
+      backgroundColor: palette.elevated,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
       ),
@@ -976,9 +1100,9 @@ class _HomePageState extends State<HomePage> {
                 padding: const EdgeInsets.all(16),
                 child: Text(
                   '暂无群聊，先创建一个吧',
-                  style: Theme.of(sheetContext).textTheme.bodySmall?.copyWith(
-                    color: palette.subtext,
-                  ),
+                  style: Theme.of(
+                    sheetContext,
+                  ).textTheme.bodySmall?.copyWith(color: palette.subtext),
                 ),
               )
             else
@@ -1002,7 +1126,11 @@ class _HomePageState extends State<HomePage> {
                             : '${room.memberCount} 名成员',
                       ),
                       trailing: room.isMember
-                          ? const Icon(Icons.check_circle, size: 20, color: Tg.online)
+                          ? const Icon(
+                              Icons.check_circle,
+                              size: 20,
+                              color: Tg.online,
+                            )
                           : null,
                       onTap: () {
                         Navigator.of(sheetContext).pop();
@@ -1020,9 +1148,9 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _joinRoom(RoomSummary room) async {
     if (!_client.connected) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('未连接，无法加入群聊')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('未连接，无法加入群聊')));
       return;
     }
     // Already a member — just open the (possibly cached) conversation.
@@ -1034,22 +1162,24 @@ class _HomePageState extends State<HomePage> {
       final joined = await _client.joinRoom(room.id);
       if (!joined) {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('群不存在或无法加入')),
-          );
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('群不存在或无法加入')));
         }
         return;
       }
     } on HubException catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.message)));
       }
       return;
     }
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已加入群聊「${room.name}」')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('已加入群聊「${room.name}」')));
       _openChat(room.id, isRoom: true);
     }
   }
@@ -1059,7 +1189,7 @@ class _HomePageState extends State<HomePage> {
     final name = await showDialog<String>(
       context: context,
       builder: (context) => AlertDialog(
-        backgroundColor: TgPalette.of(context).panel,
+        backgroundColor: TgPalette.of(context).elevated,
         title: const Text('新建群聊'),
         content: TextField(
           controller: controller,
@@ -1101,15 +1231,36 @@ class _HomePageState extends State<HomePage> {
     // instead of silently doing nothing.
     final conv = isRoom
         ? (_client.conversationById(id) ??
-            _client.ensureRoomConversation(id, id))
+              _client.ensureRoomConversation(id, id))
         : _client.openConversation(id);
+    // Custom transition (fade + slight upward slide) instead of the default
+    // Material push: feels like Telegram's secondary-screen transition.
     Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (context) => ChatPage(
+      PageRouteBuilder<void>(
+        transitionDuration: const Duration(milliseconds: 300),
+        reverseTransitionDuration: const Duration(milliseconds: 260),
+        pageBuilder: (context, animation, secondaryAnimation) => ChatPage(
           client: _client,
           conversation: conv,
           onToggleTheme: widget.onToggleTheme,
         ),
+        transitionsBuilder: (context, animation, secondaryAnimation, child) {
+          final curved = CurvedAnimation(
+            parent: animation,
+            curve: Curves.easeOutCubic,
+            reverseCurve: Curves.easeInCubic,
+          );
+          return FadeTransition(
+            opacity: curved,
+            child: SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(0, 0.06),
+                end: Offset.zero,
+              ).animate(curved),
+              child: child,
+            ),
+          );
+        },
       ),
     );
   }
@@ -1135,7 +1286,17 @@ class ChatPage extends StatefulWidget {
 
 class _ChatPageState extends State<ChatPage> {
   final _composer = TextEditingController();
+  final _composerFocus = FocusNode();
   final _scroll = ScrollController();
+
+  /// Ids of messages that already existed when the page opened — they render
+  /// statically. New ids are added here the first time they're built so each
+  /// message's entrance animation plays exactly once (scroll-in/out doesn't
+  /// replay it, since the set check is id-based, not index-based).
+  late final Set<String> _animatedIds;
+
+  /// Last observed message count, for the near-bottom auto-scroll.
+  late int _lastCount;
 
   @override
   void initState() {
@@ -1146,6 +1307,8 @@ class _ChatPageState extends State<ChatPage> {
     widget.client.activeConversationId = widget.conversation.id;
     widget.client.markConversationRead(widget.conversation.id);
     widget.client.sendReadReceipt(widget.conversation.id);
+    _animatedIds = {for (final m in widget.conversation.messages) m.id};
+    _lastCount = widget.conversation.messages.length;
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
   }
 
@@ -1155,6 +1318,7 @@ class _ChatPageState extends State<ChatPage> {
       widget.client.activeConversationId = null;
     }
     _composer.dispose();
+    _composerFocus.dispose();
     _scroll.dispose();
     super.dispose();
   }
@@ -1164,9 +1328,9 @@ class _ChatPageState extends State<ChatPage> {
     if (text.trim().isEmpty) return;
     if (!widget.client.connected) {
       // Offline browsing: cached history is readable, sending is not.
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('未连接，无法发送消息')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('未连接，无法发送消息')));
       return;
     }
     try {
@@ -1176,19 +1340,27 @@ class _ChatPageState extends State<ChatPage> {
         widget.client.sendMessage(widget.conversation.id, text);
       }
     } on HubException catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(e.message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(e.message)));
       return;
     }
     _composer.clear();
-    _scrollToBottom();
+    _scrollToBottom(animate: true);
   }
 
-  void _scrollToBottom() {
+  void _scrollToBottom({bool animate = false}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scroll.hasClients) {
-        _scroll.jumpTo(_scroll.position.maxScrollExtent);
+      if (!_scroll.hasClients) return;
+      final target = _scroll.position.maxScrollExtent;
+      if (animate) {
+        _scroll.animateTo(
+          target,
+          duration: const Duration(milliseconds: 260),
+          curve: Curves.easeOutCubic,
+        );
+      } else {
+        _scroll.jumpTo(target);
       }
     });
   }
@@ -1208,12 +1380,21 @@ class _ChatPageState extends State<ChatPage> {
         ),
         title: Row(
           children: [
-            TgAvatar(
-              id: widget.conversation.id,
-              size: 38,
-              title: widget.conversation.title,
-              isRoom: widget.conversation.isRoom,
-              online: _clientIsOnline(widget.conversation.id),
+            // Gentle entrance (fade + slight scale) for the header avatar —
+            // replaces the Hero fly-through that crashed mid-flight.
+            TweenAnimationBuilder<double>(
+              tween: Tween(begin: 0.72, end: 1),
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeOutBack,
+              builder: (context, scale, child) =>
+                  Transform.scale(scale: scale, child: child),
+              child: TgAvatar(
+                id: widget.conversation.id,
+                size: 38,
+                title: widget.conversation.title,
+                isRoom: widget.conversation.isRoom,
+                online: _clientIsOnline(widget.conversation.id),
+              ),
             ),
             const SizedBox(width: 10),
             Expanded(
@@ -1233,8 +1414,8 @@ class _ChatPageState extends State<ChatPage> {
                     widget.conversation.isRoom
                         ? '群聊'
                         : (_clientIsOnline(widget.conversation.id)
-                            ? '在线'
-                            : '离线'),
+                              ? '在线'
+                              : '离线'),
                     style: theme.textTheme.bodySmall?.copyWith(
                       fontSize: 12,
                       color: _clientIsOnline(widget.conversation.id)
@@ -1270,36 +1451,42 @@ class _ChatPageState extends State<ChatPage> {
       ),
       body: AnimatedBuilder(
         animation: widget.client,
-        builder: (context, _) => Column(
-          children: [
-            Expanded(
-              child: widget.conversation.messages.isEmpty
-                  ? _emptyState(theme)
-                  : ListView.builder(
-                      controller: _scroll,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 8,
+        builder: (context, _) {
+          _maybeAutoScroll();
+          return Column(
+            children: [
+              Expanded(
+                child: widget.conversation.messages.isEmpty
+                    ? _emptyState(theme)
+                    : ListView.builder(
+                        controller: _scroll,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
+                        itemCount: widget.conversation.messages.length,
+                        itemBuilder: (context, i) {
+                          final msg = widget.conversation.messages[i];
+                          final prev = i > 0
+                              ? widget.conversation.messages[i - 1]
+                              : null;
+                          return Column(
+                            children: [
+                              if (prev == null || !_sameDay(prev.ts, msg.ts))
+                                _dateChip(context, msg.ts),
+                              _AnimatedBubble(
+                                animate: _animatedIds.add(msg.id),
+                                child: _messageBubble(context, msg),
+                              ),
+                            ],
+                          );
+                        },
                       ),
-                      itemCount: widget.conversation.messages.length,
-                      itemBuilder: (context, i) {
-                        final msg = widget.conversation.messages[i];
-                        final prev = i > 0
-                            ? widget.conversation.messages[i - 1]
-                            : null;
-                        return Column(
-                          children: [
-                            if (prev == null || !_sameDay(prev.ts, msg.ts))
-                              _dateChip(context, msg.ts),
-                            _messageBubble(context, msg),
-                          ],
-                        );
-                      },
-                    ),
-            ),
-            _composerBar(),
-          ],
-        ),
+              ),
+              _composerBar(),
+            ],
+          );
+        },
       ),
     );
   }
@@ -1318,7 +1505,8 @@ class _ChatPageState extends State<ChatPage> {
     final yesterday = now.subtract(const Duration(days: 1));
     final sameDay =
         t.year == now.year && t.month == now.month && t.day == now.day;
-    final isYesterday = t.year == yesterday.year &&
+    final isYesterday =
+        t.year == yesterday.year &&
         t.month == yesterday.month &&
         t.day == yesterday.day;
     final label = sameDay
@@ -1360,14 +1548,16 @@ class _ChatPageState extends State<ChatPage> {
       info = await widget.client.roomMembers(widget.conversation.id);
     } on HubException catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.message)));
       }
       return;
     }
     if (!mounted) return;
     showModalBottomSheet<void>(
       context: context,
-      backgroundColor: palette.panel,
+      backgroundColor: palette.elevated,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
       ),
@@ -1393,9 +1583,9 @@ class _ChatPageState extends State<ChatPage> {
                 padding: const EdgeInsets.all(16),
                 child: Text(
                   '暂无成员',
-                  style: Theme.of(sheetContext).textTheme.bodySmall?.copyWith(
-                    color: palette.subtext,
-                  ),
+                  style: Theme.of(
+                    sheetContext,
+                  ).textTheme.bodySmall?.copyWith(color: palette.subtext),
                 ),
               )
             else
@@ -1450,13 +1640,9 @@ class _ChatPageState extends State<ChatPage> {
           ),
           const SizedBox(height: 12),
           Text(
-            widget.conversation.isRoom
-                ? '群聊已创建，说点什么吧'
-                : '对方离线时消息会缓存，上线后自动送达',
+            widget.conversation.isRoom ? '群聊已创建，说点什么吧' : '对方离线时消息会缓存，上线后自动送达',
             textAlign: TextAlign.center,
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: palette.subtext,
-            ),
+            style: theme.textTheme.bodySmall?.copyWith(color: palette.subtext),
           ),
         ],
       ),
@@ -1468,7 +1654,9 @@ class _ChatPageState extends State<ChatPage> {
     final palette = TgPalette.of(context);
     final isMine = msg.isMine;
     final showSender =
-        !isMine && widget.conversation.isRoom && msg.from != widget.client.myNodeId;
+        !isMine &&
+        widget.conversation.isRoom &&
+        msg.from != widget.client.myNodeId;
     final senderName = showSender ? widget.client.displayName(msg.from) : '';
 
     return Align(
@@ -1581,14 +1769,24 @@ class _ChatPageState extends State<ChatPage> {
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
           Expanded(
-            child: Container(
+            // Input pill: subtle blue border glow on focus.
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 200),
+              curve: Curves.easeOutCubic,
               padding: const EdgeInsets.symmetric(horizontal: 14),
               decoration: BoxDecoration(
                 color: palette.chatBg,
                 borderRadius: BorderRadius.circular(22),
+                border: Border.all(
+                  color: _composerFocus.hasFocus
+                      ? Tg.blue.withValues(alpha: 0.5)
+                      : Colors.transparent,
+                  width: 1.2,
+                ),
               ),
               child: TextField(
                 controller: _composer,
+                focusNode: _composerFocus,
                 minLines: 1,
                 maxLines: 5,
                 textInputAction: TextInputAction.send,
@@ -1605,10 +1803,32 @@ class _ChatPageState extends State<ChatPage> {
             ),
           ),
           const SizedBox(width: 4),
-          IconButton(
-            onPressed: _send,
-            icon: const Icon(Icons.send, color: Tg.blue, size: 24),
-            tooltip: '发送',
+          // Send button lights up (gray -> Telegram blue) once there is text.
+          ListenableBuilder(
+            listenable: _composer,
+            builder: (context, _) {
+              final hasText = _composer.text.trim().isNotEmpty;
+              return IconButton(
+                onPressed: hasText ? _send : null,
+                tooltip: '发送',
+                icon: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 200),
+                  transitionBuilder: (child, anim) => ScaleTransition(
+                    scale: CurvedAnimation(
+                      parent: anim,
+                      curve: Curves.easeOutBack,
+                    ),
+                    child: child,
+                  ),
+                  child: Icon(
+                    hasText ? Icons.send : Icons.send_outlined,
+                    key: ValueKey(hasText),
+                    color: hasText ? Tg.blue : palette.subtext,
+                    size: 24,
+                  ),
+                ),
+              );
+            },
           ),
         ],
       ),
@@ -1620,5 +1840,163 @@ class _ChatPageState extends State<ChatPage> {
     final h = t.hour.toString().padLeft(2, '0');
     final m = t.minute.toString().padLeft(2, '0');
     return '$h:$m';
+  }
+
+  /// Smoothly scrolls to the newest message when the user is already near the
+  /// bottom (or just sent one) — never yanks the list out from under someone
+  /// reading history.
+  void _maybeAutoScroll() {
+    final count = widget.conversation.messages.length;
+    if (count == _lastCount) return;
+    final grew = count > _lastCount;
+    _lastCount = count;
+    if (!grew) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scroll.hasClients) return;
+      final pos = _scroll.position;
+      if (pos.maxScrollExtent - pos.pixels < 120) {
+        _scroll.animateTo(
+          pos.maxScrollExtent,
+          duration: const Duration(milliseconds: 260),
+          curve: Curves.easeOutCubic,
+        );
+      }
+    });
+  }
+}
+
+/// One-shot entrance animation for newly added message bubbles: fade in with
+/// a slight upward slide (Telegram-style). Pass [animate] = false for history
+/// so old messages render statically when scrolled into view.
+class _AnimatedBubble extends StatefulWidget {
+  const _AnimatedBubble({required this.animate, required this.child});
+
+  final bool animate;
+  final Widget child;
+
+  @override
+  State<_AnimatedBubble> createState() => _AnimatedBubbleState();
+}
+
+class _AnimatedBubbleState extends State<_AnimatedBubble>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<double> _fade;
+  late final Animation<Offset> _slide;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 240),
+    )..value = widget.animate ? 0.0 : 1.0;
+    final curved = CurvedAnimation(
+      parent: _controller,
+      curve: Curves.easeOutCubic,
+    );
+    _fade = Tween<double>(begin: 0, end: 1).animate(curved);
+    _slide = Tween<Offset>(
+      begin: const Offset(0, 0.25),
+      end: Offset.zero,
+    ).animate(curved);
+    if (widget.animate) _controller.forward();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _fade,
+      child: SlideTransition(position: _slide, child: widget.child),
+    );
+  }
+}
+
+/// Skeleton placeholder rows shown while the app auto-connects on first
+/// launch (no cached conversations yet). Pulsing opacity, built-in animation
+/// only — no extra dependency.
+class _SkeletonConversationList extends StatefulWidget {
+  const _SkeletonConversationList();
+
+  @override
+  State<_SkeletonConversationList> createState() =>
+      _SkeletonConversationListState();
+}
+
+class _SkeletonConversationListState extends State<_SkeletonConversationList>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final base = TgPalette.of(context).hairline;
+    return FadeTransition(
+      opacity: Tween<double>(
+        begin: 0.45,
+        end: 1,
+      ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeInOut)),
+      child: ListView.builder(
+        physics: const NeverScrollableScrollPhysics(),
+        itemCount: 9,
+        itemBuilder: (context, i) => Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Row(
+            children: [
+              Container(
+                width: 54,
+                height: 54,
+                decoration: BoxDecoration(color: base, shape: BoxShape.circle),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      height: 14,
+                      width: double.infinity,
+                      decoration: BoxDecoration(
+                        color: base,
+                        borderRadius: BorderRadius.circular(7),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Container(
+                      height: 12,
+                      width: 140,
+                      decoration: BoxDecoration(
+                        color: base,
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }

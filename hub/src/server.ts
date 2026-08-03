@@ -168,6 +168,8 @@ export class Hub {
         return this.onRoomList(session, frame);
       case 'room/members':
         return this.onRoomMembers(session, frame);
+      case 'conv/clear':
+        return void this.onConversationClear(session, frame);
       default:
         this.send(session, {
           type: 'ack',
@@ -418,6 +420,25 @@ export class Hub {
       to: sender,
       roomId,
       payload: { ok: true, ts, id },
+    });
+  }
+
+  /**
+   * Deletes a conversation's history on the hub: 1:1 (frame.to) or a room
+   * (frame.roomId). Both sides lose the messages on their next history pull,
+   * which is what the client's swipe-to-delete expects. The `cleared` marker
+   * lets clients distinguish this ack from a plain msg ack.
+   */
+  private onConversationClear(session: Session, frame: ChatFrame): void {
+    const nodeId = session.nodeId;
+    const peer = frame.to; // 1:1 peer node
+    const roomId = frame.roomId; // group room
+    if (!nodeId || (!peer && !roomId)) return;
+    this.store.clearConversation(nodeId, peer ?? null, roomId ?? null);
+    this.send(session, {
+      type: 'ack',
+      to: nodeId,
+      payload: { ok: true, cleared: roomId ?? peer },
     });
   }
 
