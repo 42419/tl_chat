@@ -6,7 +6,7 @@
 
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:tl_chat/main.dart';
+import 'package:tl_chat/app.dart';
 
 void main() {
   testWidgets('ChatApp renders the connection panel', (WidgetTester tester) async {
