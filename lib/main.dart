@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -499,18 +500,18 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _connectionBadge(ThemeData theme) {
-    final text = _client.phase == ConnectionPhase.connected
-        ? '已连接'
-        : _client.phase == ConnectionPhase.connecting
-        ? '连接中'
-        : _client.phase == ConnectionPhase.failed
-        ? '连接失败'
-        : '未连接';
-    final color = _client.phase == ConnectionPhase.connected
-        ? Tg.online
-        : _client.phase == ConnectionPhase.failed
-        ? Tg.error
-        : Tg.sent;
+    final text = switch (_client.phase) {
+      ConnectionPhase.connected => '已连接',
+      ConnectionPhase.connecting => '连接中',
+      ConnectionPhase.reconnecting => '重连中',
+      ConnectionPhase.failed => '连接失败',
+      ConnectionPhase.unconnected => '未连接',
+    };
+    final color = switch (_client.phase) {
+      ConnectionPhase.connected => Tg.online,
+      ConnectionPhase.failed => Tg.error,
+      _ => Tg.sent,
+    };
     return Center(
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
@@ -686,22 +687,26 @@ class _HomePageState extends State<HomePage> {
         : conversations
               .where((c) => c.title.toLowerCase().contains(query))
               .toList();
+    final reconnecting = _client.phase == ConnectionPhase.reconnecting;
 
     return Column(
       children: [
         // Offline browsing banner: cached history is viewable without a
         // connection; offer a way back to the connect panel. While auto-login
-        // is running, show progress instead (WeChat-style silent reconnect).
+        // or auto-reconnect is running, show progress instead (Telegram-style
+        // silent reconnection).
         if (!_client.connected)
           Material(
             color: palette.chatBg,
             child: InkWell(
-              onTap: _autoLoginInFlight ? null : _showConnectPanel,
+              onTap: _autoLoginInFlight || reconnecting
+                  ? null
+                  : _showConnectPanel,
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
                 child: Row(
                   children: [
-                    if (_autoLoginInFlight)
+                    if (_autoLoginInFlight || reconnecting)
                       const SizedBox(
                         width: 14,
                         height: 14,
@@ -712,15 +717,23 @@ class _HomePageState extends State<HomePage> {
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        _autoLoginInFlight ? '正在自动连接…' : '离线模式：显示本地缓存记录',
+                        reconnecting
+                            ? '连接断开，正在重连…'
+                            : _autoLoginInFlight
+                            ? '正在自动连接…'
+                            : '离线模式：显示本地缓存记录',
                         style: theme.textTheme.bodySmall?.copyWith(
                           color: palette.subtext,
                         ),
                       ),
                     ),
                     TextButton(
-                      onPressed: _autoLoginInFlight ? null : _showConnectPanel,
-                      child: Text(_autoLoginInFlight ? '连接中' : '去连接'),
+                      onPressed: _autoLoginInFlight || reconnecting
+                          ? null
+                          : _showConnectPanel,
+                      child: Text(
+                        _autoLoginInFlight || reconnecting ? '连接中' : '去连接',
+                      ),
                     ),
                   ],
                 ),
@@ -1658,89 +1671,166 @@ class _ChatPageState extends State<ChatPage> {
         widget.conversation.isRoom &&
         msg.from != widget.client.myNodeId;
     final senderName = showSender ? widget.client.displayName(msg.from) : '';
+    final failed = isMine && msg.status == MessageStatus.failed;
 
-    return Align(
-      alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.only(bottom: 5),
-        padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 8),
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.of(context).size.width * 0.78,
-        ),
-        decoration: BoxDecoration(
-          color: isMine ? palette.outgoing : palette.incoming,
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(17),
-            topRight: const Radius.circular(17),
-            bottomLeft: Radius.circular(isMine ? 17 : 5),
-            bottomRight: Radius.circular(isMine ? 5 : 17),
+    return GestureDetector(
+      onLongPressStart: (details) => _showMessageMenu(context, msg, details),
+      behavior: HitTestBehavior.translucent,
+      child: Align(
+        alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
+        child: Container(
+          margin: const EdgeInsets.only(bottom: 5),
+          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 8),
+          constraints: BoxConstraints(
+            maxWidth: MediaQuery.of(context).size.width * 0.78,
           ),
-          boxShadow: const [
-            BoxShadow(
-              color: Color(0x0d000000),
-              blurRadius: 1,
-              offset: Offset(0, 0.5),
+          decoration: BoxDecoration(
+            color: isMine ? palette.outgoing : palette.incoming,
+            borderRadius: BorderRadius.only(
+              topLeft: const Radius.circular(17),
+              topRight: const Radius.circular(17),
+              bottomLeft: Radius.circular(isMine ? 17 : 5),
+              bottomRight: Radius.circular(isMine ? 5 : 17),
             ),
-          ],
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            if (showSender) ...[
-              Padding(
-                padding: const EdgeInsets.only(bottom: 3),
-                child: Text(
-                  senderName,
-                  style: TextStyle(
-                    color: Tg.avatarFor(msg.from),
-                    fontSize: 13.5,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
+            border: failed
+                ? Border.all(color: Tg.error.withValues(alpha: 0.6), width: 1)
+                : null,
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x0d000000),
+                blurRadius: 1,
+                offset: Offset(0, 0.5),
               ),
             ],
-            if (!isMine && msg.queued)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 3),
-                child: Text(
-                  '离线补发',
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: palette.subtext,
-                    fontSize: 10,
-                    letterSpacing: 0,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              if (showSender) ...[
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 3),
+                  child: Text(
+                    senderName,
+                    style: TextStyle(
+                      color: Tg.avatarFor(msg.from),
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
-              ),
-            Text(
-              msg.text,
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: palette.text,
-                fontSize: 16,
-                height: 1.35,
-              ),
-            ),
-            const SizedBox(height: 2),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  _formatTime(msg.ts),
-                  style: TextStyle(
-                    color: isMine ? Tg.sent : palette.subtext,
-                    fontSize: 11,
-                    letterSpacing: 0,
-                  ),
-                ),
-                if (isMine) ...[
-                  const SizedBox(width: 3),
-                  _statusIcon(msg.status),
-                ],
               ],
-            ),
-          ],
+              if (!isMine && msg.queued)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 3),
+                  child: Text(
+                    '离线补发',
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: palette.subtext,
+                      fontSize: 10,
+                      letterSpacing: 0,
+                    ),
+                  ),
+                ),
+              Text(
+                msg.text,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: palette.text,
+                  fontSize: 16,
+                  height: 1.35,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (failed)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 4),
+                      child: Text(
+                        '发送失败',
+                        style: TextStyle(
+                          color: Tg.error,
+                          fontSize: 11,
+                          letterSpacing: 0,
+                        ),
+                      ),
+                    ),
+                  Text(
+                    _formatTime(msg.ts),
+                    style: TextStyle(
+                      color: isMine ? Tg.sent : palette.subtext,
+                      fontSize: 11,
+                      letterSpacing: 0,
+                    ),
+                  ),
+                  if (isMine) ...[
+                    const SizedBox(width: 3),
+                    _statusIcon(msg.status),
+                  ],
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );
+  }
+
+  /// Long-press context menu on a message bubble (Phase 1.3):
+  /// - 重发 (resend): only for failed own messages — reuses the original
+  ///   clientMessageId so the hub dedupes.
+  /// - 复制 (copy): any message.
+  /// - 删除 (delete): only for failed own messages — local-only removal
+  ///   (the message never reached the hub, so nothing to clear server-side).
+  Future<void> _showMessageMenu(
+    BuildContext context,
+    ChatMessage msg,
+    LongPressStartDetails details,
+  ) async {
+    final isMine = msg.isMine;
+    final failed = isMine && msg.status == MessageStatus.failed;
+    final items = <PopupMenuEntry<String>>[
+      if (failed)
+        const PopupMenuItem<String>(value: 'resend', child: Text('重发')),
+      const PopupMenuItem<String>(value: 'copy', child: Text('复制')),
+      if (failed)
+        const PopupMenuItem<String>(value: 'delete', child: Text('删除')),
+    ];
+    if (items.isEmpty) return;
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final position = RelativeRect.fromRect(
+      Rect.fromPoints(
+        details.globalPosition,
+        details.globalPosition,
+      ),
+      Offset.zero & overlay.size,
+    );
+    if (!mounted) return;
+    final result = await showMenu<String>(
+      context: context,
+      position: position,
+      items: items,
+    );
+    if (!mounted || result == null) return;
+    switch (result) {
+      case 'resend':
+        final cmid = msg.clientMessageId;
+        if (cmid != null) {
+          widget.client.resendMessage(widget.conversation.id, cmid);
+        }
+        break;
+      case 'copy':
+        await Clipboard.setData(ClipboardData(text: msg.text));
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('已复制'), duration: Duration(seconds: 1)),
+          );
+        }
+        break;
+      case 'delete':
+        widget.client.removeMessage(widget.conversation.id, msg.id);
+        break;
+    }
   }
 
   Widget _statusIcon(MessageStatus status) {
@@ -1748,11 +1838,13 @@ class _ChatPageState extends State<ChatPage> {
       MessageStatus.sending => Icons.schedule,
       MessageStatus.sent => Icons.done,
       MessageStatus.delivered || MessageStatus.read => Icons.done_all,
+      MessageStatus.failed => Icons.error_outline,
     };
     final color = switch (status) {
       MessageStatus.sending || MessageStatus.sent => Tg.sent,
       MessageStatus.delivered => Tg.sent,
       MessageStatus.read => Tg.read,
+      MessageStatus.failed => Tg.error,
     };
     return Icon(icon, size: 14, color: color);
   }

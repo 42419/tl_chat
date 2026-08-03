@@ -3,6 +3,7 @@
 // tracking, heartbeat ping/pong, and local chat-history caching.
 
 import 'dart:async';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:tailscale/tailscale.dart';
@@ -11,7 +12,7 @@ import 'chat_cache.dart';
 import 'chat_protocol.dart';
 import '../services/notifications.dart';
 
-enum MessageStatus { sending, sent, delivered, read }
+enum MessageStatus { sending, sent, delivered, read, failed }
 
 /// A chat message as shown in the UI.
 @immutable
@@ -26,6 +27,8 @@ class ChatMessage {
     this.queued = false,
     this.status = MessageStatus.sent,
     this.hubId,
+    this.seq,
+    this.clientMessageId,
   });
 
   final String id;
@@ -43,7 +46,21 @@ class ChatMessage {
   /// The hub's SQLite row id (when known) — used to dedup history pulls.
   final String? hubId;
 
-  ChatMessage copyWith({MessageStatus? status}) => ChatMessage(
+  /// Per-conversation monotonic sequence number from the hub (incremental
+  /// sync cursor, Phase 1.2). Unknown until the hub acks an outgoing message.
+  final int? seq;
+
+  /// Client-generated idempotency key for outgoing messages (Phase 1.3).
+  /// Sent in the wire payload so the hub can dedup a resend (after a 15s ack
+  /// timeout) and the ack can be matched back to this exact message instead
+  /// of by ts (which is ambiguous when several messages land in the same ms).
+  final String? clientMessageId;
+
+  ChatMessage copyWith({
+    MessageStatus? status,
+    int? seq,
+    String? hubId,
+  }) => ChatMessage(
     id: id,
     from: from,
     roomId: roomId,
@@ -52,7 +69,9 @@ class ChatMessage {
     isMine: isMine,
     queued: queued,
     status: status ?? this.status,
-    hubId: hubId,
+    hubId: hubId ?? this.hubId,
+    seq: seq ?? this.seq,
+    clientMessageId: clientMessageId,
   );
 
   Map<String, dynamic> toJson() => {
@@ -65,6 +84,8 @@ class ChatMessage {
     'queued': queued,
     'status': status.name,
     if (hubId != null) 'hubId': hubId,
+    if (seq != null) 'seq': seq,
+    if (clientMessageId != null) 'clientMessageId': clientMessageId,
   };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
@@ -80,6 +101,8 @@ class ChatMessage {
       orElse: () => MessageStatus.sent,
     ),
     hubId: json['hubId'] as String?,
+    seq: (json['seq'] as num?)?.toInt(),
+    clientMessageId: json['clientMessageId'] as String?,
   );
 }
 
@@ -102,6 +125,10 @@ class Conversation {
   /// is not involved (it is a per-device preference).
   bool pinned = false;
 
+  /// Highest per-conversation seq seen so far (incremental sync cursor).
+  /// Persisted so a reconnect after app restart can resume incrementally.
+  int lastSeq = 0;
+
   String get lastPreview => lastMessage?.text ?? '';
   int get lastTs => lastMessage?.ts ?? 0;
 
@@ -110,6 +137,7 @@ class Conversation {
     'title': title,
     'isRoom': isRoom,
     'pinned': pinned,
+    'lastSeq': lastSeq,
     'messages': messages.map((m) => m.toJson()).toList(),
   };
 
@@ -120,11 +148,14 @@ class Conversation {
       isRoom: json['isRoom'] as bool? ?? false,
     );
     conv.pinned = json['pinned'] as bool? ?? false;
+    conv.lastSeq = (json['lastSeq'] as num?)?.toInt() ?? 0;
     for (final raw in (json['messages'] as List? ?? const [])) {
       if (raw is! Map) continue;
       final msg = ChatMessage.fromJson(Map<String, dynamic>.from(raw));
       conv.messages.add(msg);
       conv.lastMessage = msg;
+      final s = msg.seq ?? 0;
+      if (s > conv.lastSeq) conv.lastSeq = s;
     }
     return conv;
   }
@@ -177,7 +208,15 @@ class HubException implements Exception {
 }
 
 /// Modes the app runs in for the connection panel.
-enum ConnectionPhase { unconnected, connecting, connected, failed }
+enum ConnectionPhase {
+  unconnected,
+  connecting,
+
+  /// Waiting on a backoff timer after a drop, before the next reconnect attempt.
+  reconnecting,
+  connected,
+  failed,
+}
 
 class ChatClient extends ChangeNotifier {
   ChatClient({Tailscale? tailscale})
@@ -196,6 +235,24 @@ class ChatClient extends ChangeNotifier {
   String _statusText = '未连接';
   String? _hostname;
   ConnectionPhase _phase = ConnectionPhase.unconnected;
+
+  // ─── auto-reconnect (Phase 1.1) ────────────────────────────────────
+  // Retained connection tuple so a drop can be re-dialed without asking the
+  // user again (Telegram-style invisible reconnection).
+  String? _hubHost;
+  int? _hubPort;
+  Timer? _reconnectTimer;
+  int _reconnectAttempt = 0;
+  bool _autoReconnect = false;
+  static const int _maxReconnectSeconds = 30;
+
+  // ─── pending-send tracking (Phase 1.3) ─────────────────────────────
+  // Outgoing messages that haven't received their ack yet, keyed by
+  // clientMessageId. Each entry owns a 15s timeout timer; on expiry the
+  // message flips to [MessageStatus.failed] so the user can long-press to
+  // resend (reusing the same clientMessageId — the hub dedupes).
+  final Map<String, _PendingSend> _pending = {};
+  static const Duration _ackTimeout = Duration(seconds: 15);
 
   Completer<void>? _helloAckCompleter;
   Completer<String>? _roomCreateCompleter;
@@ -293,12 +350,23 @@ class ChatClient extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Re-syncs with the hub: re-pulls history (dedup makes it idempotent) and
-  /// refreshes the room list. Used by pull-to-refresh on the conversation list.
+  /// Re-syncs with the hub: pulls incremental history since each conversation's
+  /// last seq (dedup makes it idempotent) and refreshes the room list. Used by
+  /// pull-to-refresh on the conversation list.
   Future<void> refresh() async {
     if (!_connected || _myNodeId == null) return;
+    final cursors = <String, int>{
+      for (final c in _conversations.values)
+        if (c.lastSeq > 0) c.id: c.lastSeq,
+    };
     _write(
-      ChatFrame(type: 'offline', from: _myNodeId, payload: {'limit': 200}),
+      ChatFrame(
+        type: 'offline',
+        from: _myNodeId,
+        payload: cursors.isEmpty
+            ? {'limit': 200}
+            : {'limit': 200, 'after': cursors},
+      ),
     );
     await listRooms().then<void>((_) {}, onError: (_) {});
   }
@@ -362,7 +430,11 @@ class ChatClient extends ChangeNotifier {
     required String hostname,
   }) async {
     if (_connected) return;
+    // Retain the connection tuple so a drop can auto-reconnect.
+    _hubHost = hubHost;
+    _hubPort = hubPort;
     _hostname = hostname;
+    _reconnectTimer?.cancel();
     _statusText = '连接中…';
     _lastError = null;
     _phase = ConnectionPhase.connecting;
@@ -409,12 +481,29 @@ class ChatClient extends ChangeNotifier {
         },
       );
 
-      // Pull recent history (the hub replies with an `offline` frame).
+      // Pull history (the hub replies with an `offline` frame). Reconnects
+      // send per-conversation cursors so only newer messages come back
+      // (Phase 1.2 incremental sync); a fresh connect pulls the full window.
+      final cursors = _autoReconnect
+          ? <String, int>{
+              for (final c in _conversations.values)
+                if (c.lastSeq > 0) c.id: c.lastSeq,
+            }
+          : null;
       _write(
-        ChatFrame(type: 'offline', from: _myNodeId, payload: {'limit': 200}),
+        ChatFrame(
+          type: 'offline',
+          from: _myNodeId,
+          payload: cursors == null || cursors.isEmpty
+              ? {'limit': 200}
+              : {'limit': 200, 'after': cursors},
+        ),
       );
 
       _connected = true;
+      // A connection was established — from here on a drop auto-reconnects.
+      _autoReconnect = true;
+      _reconnectAttempt = 0;
       // 群名不随历史消息下发：连接后主动拉一次群列表，让 _onRoomList 把
       // 重建会话的标题从 roomId 修正为真实群名（清缓存重登后群名不再丢失）。
       unawaited(listRooms().then<void>((_) {}, onError: (_) {}));
@@ -522,6 +611,9 @@ class ChatClient extends ChangeNotifier {
       final error = frame.payload?['error'] ?? 'unknown';
       _statusText = '被拒绝: $error';
       _phase = ConnectionPhase.failed;
+      // Auth rejection: don't auto-reconnect — a bad credential must not loop.
+      _autoReconnect = false;
+      _reconnectTimer?.cancel();
       // Complete a pending hello waiter with the real rejection instead of
       // letting connect() hang until its 10s timeout with a misleading error.
       final hello = _helloAckCompleter;
@@ -555,20 +647,110 @@ class ChatClient extends ChangeNotifier {
       _helloAckCompleter!.complete();
       _helloAckCompleter = null;
     } else {
-      // msg ack — mark optimistic messages as sent.
-      var changed = false;
-      for (final conv in _conversations.values) {
-        for (var i = 0; i < conv.messages.length; i++) {
-          if (conv.messages[i].status == MessageStatus.sending) {
-            conv.messages[i] = conv.messages[i].copyWith(
-              status: MessageStatus.sent,
-            );
+      // msg / room/msg ack — Phase 1.3: match by clientMessageId when present
+      // (the hub echoes it back) so the ack lands on the exact message that
+      // was sent, instead of the old "flip every sending message to sent"
+      // broadcast. Falls back to ts matching for legacy hubs that don't echo
+      // clientMessageId.
+      final ackClientMessageId =
+          frame.payload?['clientMessageId'] as String?;
+      final ackSeq = (frame.payload?['seq'] as num?)?.toInt();
+      final ackHubId = frame.payload?['id'];
+      final ackHubIdStr =
+          ackHubId is num ? ackHubId.toString() : ackHubId as String?;
+      final ackTs = frame.ts;
+
+      if (ackClientMessageId != null) {
+        final pending = _pending.remove(ackClientMessageId);
+        pending?.timer.cancel();
+        final conv = pending != null
+            ? _conversations[pending.convId]
+            : null;
+        if (conv != null) {
+          var changed = false;
+          for (var i = 0; i < conv.messages.length; i++) {
+            final m = conv.messages[i];
+            if (m.clientMessageId != ackClientMessageId) continue;
+            // Don't downgrade an already-read message back to sent (a
+            // delayed ack could arrive after the read receipt propagated).
+            if (m.status == MessageStatus.read) break;
+            var updated = m.copyWith(status: MessageStatus.sent);
+            if (ackSeq != null) updated = updated.copyWith(seq: ackSeq);
+            if (ackHubIdStr != null) {
+              updated = updated.copyWith(hubId: ackHubIdStr);
+            }
+            conv.messages[i] = updated;
+            if (ackSeq != null && ackSeq > conv.lastSeq) {
+              conv.lastSeq = ackSeq;
+            }
             changed = true;
+            break;
+          }
+          if (changed) {
             _persist(conv);
+            notifyListeners();
           }
         }
+        // If pending was null (e.g. ack arrived after the 15s timeout fired
+        // and the message is already failed): re-flip to sent anyway — the
+        // hub confirmed it. Find by clientMessageId across conversations.
+        if (pending == null) {
+          _applyLateAck(ackClientMessageId, ackSeq, ackHubIdStr);
+        }
+      } else {
+        // Legacy path (hub didn't echo clientMessageId): match by ts. Pick
+        // the FIRST sending message at that ts instead of broadcasting, to
+        // avoid one ack flipping a whole batch of unrelated sends to sent.
+        final ackTsValue = ackTs;
+        var changed = false;
+        Conversation? matchedConv;
+        outer:
+        for (final conv in _conversations.values) {
+          for (var i = 0; i < conv.messages.length; i++) {
+            final m = conv.messages[i];
+            if (m.status != MessageStatus.sending) continue;
+            if (ackTsValue != null && m.ts != ackTsValue) continue;
+            var updated = m.copyWith(status: MessageStatus.sent);
+            if (ackSeq != null) updated = updated.copyWith(seq: ackSeq);
+            if (ackHubIdStr != null) {
+              updated = updated.copyWith(hubId: ackHubIdStr);
+            }
+            conv.messages[i] = updated;
+            if (ackSeq != null && ackSeq > conv.lastSeq) {
+              conv.lastSeq = ackSeq;
+            }
+            matchedConv = conv;
+            changed = true;
+            break outer;
+          }
+        }
+        if (changed && matchedConv != null) {
+          _persist(matchedConv);
+          notifyListeners();
+        }
       }
-      if (changed) notifyListeners();
+    }
+  }
+
+  /// Handles an ack that arrives AFTER its 15s timeout already fired — the
+  /// message is currently `failed` in the UI, but the hub confirms it was
+  /// actually persisted. Flip it to `sent` (with the hub's id/seq) so the
+  /// user doesn't see a phantom failure.
+  void _applyLateAck(String clientMessageId, int? seq, String? hubId) {
+    for (final conv in _conversations.values) {
+      for (var i = 0; i < conv.messages.length; i++) {
+        final m = conv.messages[i];
+        if (m.clientMessageId != clientMessageId) continue;
+        if (m.status != MessageStatus.failed) return;
+        var updated = m.copyWith(status: MessageStatus.sent);
+        if (seq != null) updated = updated.copyWith(seq: seq);
+        if (hubId != null) updated = updated.copyWith(hubId: hubId);
+        conv.messages[i] = updated;
+        if (seq != null && seq > conv.lastSeq) conv.lastSeq = seq;
+        _persist(conv);
+        notifyListeners();
+        return;
+      }
     }
   }
 
@@ -582,6 +764,7 @@ class ChatClient extends ChangeNotifier {
     final isQueued = frame.payload?['queued'] == true;
     final rawId = frame.payload?['id'];
     final hubId = rawId is num ? rawId.toString() : rawId as String?;
+    final seq = (frame.payload?['seq'] as num?)?.toInt();
     final threadId = roomId ?? from;
     final conv = _conversations.putIfAbsent(
       threadId,
@@ -607,9 +790,11 @@ class ChatClient extends ChangeNotifier {
       isMine: from == _myNodeId,
       queued: isQueued,
       hubId: hubId,
+      seq: seq,
     );
     conv.messages.add(msg);
     conv.lastMessage = msg;
+    if (seq != null && seq > conv.lastSeq) conv.lastSeq = seq;
     if (msg.isMine || threadId == activeConversationId) {
       // Message is in the conversation currently on screen: acknowledge it
       // right away so the sender sees the blue read check while we chat.
@@ -673,6 +858,7 @@ class ChatClient extends ChangeNotifier {
       final text = payload is Map ? (payload['text'] as String?) ?? '' : '';
       final ts = (map['ts'] as num?)?.toInt() ?? 0;
       final hubId = '${map['id'] ?? ''}';
+      final seq = (map['seq'] as num?)?.toInt();
       final from = sender ?? '?';
       final threadId = roomId ?? from;
       final conv = _conversations.putIfAbsent(
@@ -704,9 +890,11 @@ class ChatClient extends ChangeNotifier {
         isMine: from == _myNodeId,
         queued: map['delivered'] != true,
         hubId: hubId.isEmpty ? null : hubId,
+        seq: seq,
       );
       conv.messages.add(msg);
       conv.lastMessage = msg;
+      if (seq != null && seq > conv.lastSeq) conv.lastSeq = seq;
       // History landing in the open conversation is read too.
       if (from != _myNodeId && threadId == activeConversationId) {
         sendReadReceipt(threadId);
@@ -759,6 +947,7 @@ class ChatClient extends ChangeNotifier {
     // after a rejection ack); only downgrade on a clean disconnect.
     if (_phase != ConnectionPhase.failed) _phase = ConnectionPhase.unconnected;
     notifyListeners();
+    _maybeScheduleReconnect();
   }
 
   void _fail(String message) {
@@ -767,6 +956,45 @@ class ChatClient extends ChangeNotifier {
     _statusText = '连接失败';
     _phase = ConnectionPhase.failed;
     notifyListeners();
+    _maybeScheduleReconnect();
+  }
+
+  /// Starts the auto-reconnect backoff timer. Only runs after the client has
+  /// connected at least once (first-launch failures just show the connect
+  /// panel); auth rejections disable it so a bad credential never loops.
+  void _maybeScheduleReconnect() {
+    if (!_autoReconnect || _connected) return;
+    _reconnectTimer?.cancel();
+    _reconnectAttempt++;
+    final exp = (_reconnectAttempt - 1).clamp(0, 5); // 1s,2s,4s,8s,16s,30s…
+    var baseMs = (1 << exp) * 1000;
+    if (baseMs > _maxReconnectSeconds * 1000) {
+      baseMs = _maxReconnectSeconds * 1000;
+    }
+    // ±20% random jitter: without it, all devices reconnect in lockstep.
+    final jitterMs = Random().nextInt(baseMs ~/ 5 + 1);
+    _phase = ConnectionPhase.reconnecting;
+    _statusText = '重连中…';
+    notifyListeners();
+    _reconnectTimer = Timer(Duration(milliseconds: baseMs + jitterMs), () {
+      unawaited(_reconnect());
+    });
+  }
+
+  Future<void> _reconnect() async {
+    _reconnectTimer?.cancel();
+    final hubHost = _hubHost;
+    final hubPort = _hubPort;
+    if (!_autoReconnect || _connected || hubHost == null || hubPort == null) {
+      return;
+    }
+    try {
+      // connect() sets phase=connecting internally and, on failure, _fail()
+      // re-schedules the backoff (if auto-reconnect is still enabled).
+      await connect(hubHost: hubHost, hubPort: hubPort, hostname: _hostname ?? '');
+    } catch (_) {
+      // _fail already handled state + re-scheduling.
+    }
   }
 
   /// Sends a 1:1 text message. Returns the message for optimistic UI.
@@ -776,6 +1004,7 @@ class ChatClient extends ChangeNotifier {
       throw const HubException('未连接');
     }
     final ts = DateTime.now().millisecondsSinceEpoch;
+    final clientMessageId = _newClientMessageId(ts);
     final msg = ChatMessage(
       id: 'local-$ts-${to.hashCode}',
       from: _myNodeId ?? '',
@@ -783,6 +1012,7 @@ class ChatClient extends ChangeNotifier {
       ts: ts,
       isMine: true,
       status: MessageStatus.sending,
+      clientMessageId: clientMessageId,
     );
     final conv = _conversations.putIfAbsent(
       to,
@@ -791,13 +1021,24 @@ class ChatClient extends ChangeNotifier {
     conv.messages.add(msg);
     conv.lastMessage = msg;
     _persist(conv);
+    _trackPending(
+      convId: to,
+      isRoom: false,
+      targetId: to,
+      clientMessageId: clientMessageId,
+      ts: ts,
+    );
     _write(
       ChatFrame(
         type: 'msg',
         from: _myNodeId,
         to: to,
         ts: ts,
-        payload: {'text': trimmed, 'hostname': _hostname ?? ''},
+        payload: {
+          'text': trimmed,
+          'hostname': _hostname ?? '',
+          'clientMessageId': clientMessageId,
+        },
       ),
     );
     notifyListeners();
@@ -870,6 +1111,7 @@ class ChatClient extends ChangeNotifier {
     final trimmed = text.trim();
     if (trimmed.isEmpty || !_connected) return;
     final ts = DateTime.now().millisecondsSinceEpoch;
+    final clientMessageId = _newClientMessageId(ts);
     final msg = ChatMessage(
       id: 'local-$ts-$roomId',
       from: _myNodeId ?? '',
@@ -877,7 +1119,8 @@ class ChatClient extends ChangeNotifier {
       text: trimmed,
       ts: ts,
       isMine: true,
-      status: MessageStatus.sent,
+      status: MessageStatus.sending,
+      clientMessageId: clientMessageId,
     );
     final conv = _conversations[roomId];
     if (conv != null) {
@@ -885,13 +1128,24 @@ class ChatClient extends ChangeNotifier {
       conv.lastMessage = msg;
       _persist(conv);
     }
+    _trackPending(
+      convId: roomId,
+      isRoom: true,
+      targetId: roomId,
+      clientMessageId: clientMessageId,
+      ts: ts,
+    );
     _write(
       ChatFrame(
         type: 'room/msg',
         from: _myNodeId,
         roomId: roomId,
         ts: ts,
-        payload: {'text': trimmed, 'hostname': _hostname ?? ''},
+        payload: {
+          'text': trimmed,
+          'hostname': _hostname ?? '',
+          'clientMessageId': clientMessageId,
+        },
       ),
     );
     notifyListeners();
@@ -1008,6 +1262,156 @@ class ChatClient extends ChangeNotifier {
     });
   }
 
+  // ─── Phase 1.3 pending-send tracking ────────────────────────────────
+
+  /// Generates a per-message idempotency key. `ts` alone can collide when
+  /// several messages land in the same millisecond, so it is mixed with a
+  /// random component. Format is opaque to the hub — it only ever compares
+  /// for equality.
+  String _newClientMessageId(int ts) {
+    final rand = Random().nextInt(1 << 32).toRadixString(36);
+    return 'c${ts.toRadixString(36)}-$rand';
+  }
+
+  /// Registers an outgoing message as awaiting ack and arms its 15s timeout.
+  void _trackPending({
+    required String convId,
+    required bool isRoom,
+    required String targetId,
+    required String clientMessageId,
+    required int ts,
+  }) {
+    // Cancel any stale entry for the same key first (defensive — should not
+    // happen because clientMessageId is unique per send).
+    _pending[clientMessageId]?.timer.cancel();
+    final timer = Timer(_ackTimeout, () => _onAckTimeout(clientMessageId));
+    _pending[clientMessageId] = _PendingSend(
+      convId: convId,
+      isRoom: isRoom,
+      targetId: targetId,
+      clientMessageId: clientMessageId,
+      ts: ts,
+      timer: timer,
+    );
+  }
+
+  /// 15s elapsed with no ack — flip the message to failed so the user can
+  /// long-press to resend. The hub is unreachable or wedged; we do NOT
+  /// auto-resend because that could create duplicates if the ack is merely
+  /// delayed (the user-initiated resend reuses clientMessageId → hub dedupes).
+  void _onAckTimeout(String clientMessageId) {
+    final pending = _pending.remove(clientMessageId);
+    if (pending == null) return;
+    final conv = _conversations[pending.convId];
+    if (conv == null) return;
+    var changed = false;
+    for (var i = 0; i < conv.messages.length; i++) {
+      final m = conv.messages[i];
+      if (m.clientMessageId != clientMessageId) continue;
+      if (m.status == MessageStatus.sending) {
+        conv.messages[i] = m.copyWith(status: MessageStatus.failed);
+        changed = true;
+      }
+    }
+    if (changed) {
+      _persist(conv);
+      notifyListeners();
+    }
+  }
+
+  /// Cancels every pending ack-timeout without touching the message status —
+  /// used on disconnect/teardown. The messages stay in `sending` so the UI
+  /// shows them as in-flight; Phase 1.4 will turn this into offline queueing
+  /// + reconnect flush. Timers are cancelled so they don't fire post-teardown
+  /// and incorrectly mark a message failed while the socket is gone.
+  void _clearPendingTimers() {
+    for (final p in _pending.values) {
+      p.timer.cancel();
+    }
+    _pending.clear();
+  }
+
+  /// Long-press「重发」entry point: re-sends a failed message using its
+  /// original clientMessageId so the hub can dedup it (no duplicate row, no
+  /// duplicate fan-out). Returns true if a resend was actually issued.
+  bool resendMessage(String conversationId, String clientMessageId) {
+    if (!_connected || _myNodeId == null) return false;
+    final conv = _conversations[conversationId];
+    if (conv == null) return false;
+    ChatMessage? target;
+    for (final m in conv.messages) {
+      if (m.clientMessageId == clientMessageId) {
+        target = m;
+        break;
+      }
+    }
+    if (target == null) return false;
+    if (target.status != MessageStatus.failed) return false;
+    // Flip back to sending and re-track the ack timeout.
+    final idx = conv.messages.indexOf(target);
+    conv.messages[idx] = target.copyWith(status: MessageStatus.sending);
+    _trackPending(
+      convId: conversationId,
+      isRoom: target.roomId != null,
+      targetId: target.roomId ?? conversationId,
+      clientMessageId: clientMessageId,
+      ts: target.ts,
+    );
+    final payload = <String, dynamic>{
+      'text': target.text,
+      'hostname': _hostname ?? '',
+      'clientMessageId': clientMessageId,
+    };
+    if (target.roomId != null) {
+      _write(
+        ChatFrame(
+          type: 'room/msg',
+          from: _myNodeId,
+          roomId: target.roomId,
+          ts: target.ts,
+          payload: payload,
+        ),
+      );
+    } else {
+      _write(
+        ChatFrame(
+          type: 'msg',
+          from: _myNodeId,
+          to: conversationId,
+          ts: target.ts,
+          payload: payload,
+        ),
+      );
+    }
+    _persist(conv);
+    notifyListeners();
+    return true;
+  }
+
+  /// Locally removes a single message (used by the long-press menu on a
+  /// failed send). The hub is never contacted — if the message had reached
+  /// the hub it would not be `failed`. Also cancels its ack-timeout if it is
+  /// somehow still pending (defensive).
+  void removeMessage(String conversationId, String messageId) {
+    final conv = _conversations[conversationId];
+    if (conv == null) return;
+    final idx = conv.messages.indexWhere((m) => m.id == messageId);
+    if (idx < 0) return;
+    final removed = conv.messages.removeAt(idx);
+    final cmid = removed.clientMessageId;
+    if (cmid != null) {
+      final pending = _pending.remove(cmid);
+      pending?.timer.cancel();
+    }
+    // Patch lastMessage if we just removed the tail.
+    if (conv.lastMessage?.id == messageId) {
+      conv.lastMessage =
+          conv.messages.isEmpty ? null : conv.messages.last;
+    }
+    _persist(conv);
+    notifyListeners();
+  }
+
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
     _heartbeatTimer = Timer.periodic(const Duration(seconds: 30), (_) {
@@ -1024,6 +1428,7 @@ class ChatClient extends ChangeNotifier {
     _heartbeatTimer = null;
     _pongTimeout?.cancel();
     _pongTimeout = null;
+    _clearPendingTimers();
     _inputSub?.cancel();
     _inputSub = null;
     _conn?.close();
@@ -1033,6 +1438,9 @@ class ChatClient extends ChangeNotifier {
   }
 
   Future<void> disconnect() async {
+    // Manual disconnect: stop auto-reconnect so it doesn't come back on its own.
+    _autoReconnect = false;
+    _reconnectTimer?.cancel();
     _write(const ChatFrame(type: 'bye'));
     await Future<void>.delayed(const Duration(milliseconds: 100));
     _teardown();
@@ -1043,7 +1451,44 @@ class ChatClient extends ChangeNotifier {
 
   @override
   void dispose() {
+    _autoReconnect = false;
+    _reconnectTimer?.cancel();
     _teardown();
     super.dispose();
   }
+}
+
+/// Tracks one outgoing message awaiting its ack (Phase 1.3).
+///
+/// Owns the ack-timeout timer so a drop/teardown can cancel it cleanly. The
+/// hub echoes `clientMessageId` back in its ack, which is how the client
+/// matches the ack to this exact pending send (replacing the old "flip every
+/// sending message to sent" broadcast).
+class _PendingSend {
+  _PendingSend({
+    required this.convId,
+    required this.isRoom,
+    required this.targetId,
+    required this.clientMessageId,
+    required this.ts,
+    required this.timer,
+  });
+
+  /// Conversation the message lives in (1:1 nodeId or room id).
+  final String convId;
+
+  /// True for `room/msg`, false for 1:1 `msg`.
+  final bool isRoom;
+
+  /// `to` for 1:1, `roomId` for rooms — where the message is addressed.
+  final String targetId;
+
+  /// Idempotency key shared with the hub.
+  final String clientMessageId;
+
+  /// Original wire ts (the hub echoes it back in its ack).
+  final int ts;
+
+  /// 15s ack-timeout timer. On fire, the message flips to failed.
+  Timer timer;
 }

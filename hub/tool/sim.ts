@@ -18,7 +18,8 @@ class SimClient {
   readonly hostname: string;
   private readonly socket: Socket;
   private readonly decoder = new FrameDecoder();
-  private inbox: ChatFrame[] = [];
+  /** Public so test scenarios can assert "no duplicate arrived". */
+  inbox: ChatFrame[] = [];
   private waiters: {
     predicate: (f: ChatFrame) => boolean;
     resolve: (f: ChatFrame) => void;
@@ -267,10 +268,151 @@ async function main(): Promise<void> {
     assert(onA2.payload?.['text'] === '自己多端', "sender's other device got its own message live");
     console.log('  ✓ sender\'s other device received the message in real-time');
 
+    // Phase 1.2: per-conversation seq + incremental sync. Fresh pair with no
+    // room membership so the increment only contains their 1:1 thread.
+    const c = new SimClient(port, 'node-c', 'carol-pc');
+    const d = new SimClient(port, 'node-d', 'dave-phone');
+    await c.hello();
+    await d.hello();
+    for (const text of ['s1', 's2', 's3']) {
+      c.send({ type: 'msg', from: 'node-c', to: 'node-d', ts: Date.now(), payload: { text } });
+      await c.waitFor((f) => f.type === 'ack' && f.payload?.['ok'] === true);
+    }
+    const d1 = await d.waitFor((f) => f.type === 'msg' && f.payload?.['text'] === 's1');
+    const d3 = await d.waitFor((f) => f.type === 'msg' && f.payload?.['text'] === 's3');
+    const cursor = d3.payload?.['seq'] as number;
+    assert(
+      d1.payload?.['seq'] === 1 && cursor === 3,
+      '1:1 messages carry a monotonic per-conversation seq',
+    );
+
+    // At the current cursor there is nothing newer -> empty increment.
+    d.send({ type: 'offline', from: 'node-d', payload: { limit: 200, after: { 'node-c': cursor } } });
+    const inc1 = await d.waitFor((f) => f.type === 'offline');
+    const inc1msgs = (inc1.payload?.['messages'] as Record<string, unknown>[] | undefined) ?? [];
+    assert(inc1msgs.length === 0, `incremental pull at cursor returns nothing (got ${inc1msgs.length})`);
+
+    // One new message -> increment returns exactly it, with seq = cursor + 1.
+    c.send({ type: 'msg', from: 'node-c', to: 'node-d', ts: Date.now(), payload: { text: 's4' } });
+    await c.waitFor((f) => f.type === 'ack' && f.payload?.['ok'] === true);
+    d.send({ type: 'offline', from: 'node-d', payload: { limit: 200, after: { 'node-c': cursor } } });
+    const inc2 = await d.waitFor((f) => f.type === 'offline');
+    const inc2msgs = (inc2.payload?.['messages'] as Record<string, unknown>[] | undefined) ?? [];
+    const inc2text = (inc2msgs[0]?.payload as Record<string, unknown> | undefined)?.['text'];
+    assert(
+      inc2msgs.length === 1 && inc2text === 's4' && inc2msgs[0]?.['seq'] === cursor + 1,
+      'incremental returns exactly the one newer message',
+    );
+    console.log('  ✓ incremental sync (after=seq) returns only newer messages');
+
+    // Phase 1.3: clientMessageId ack echo + resend idempotency. The hub must
+    // (1) echo clientMessageId back in its ack so the client can match the
+    // ack to the exact message (not a ts-based broadcast), and (2) dedup a
+    // resend with the same (sender, clientMessageId) — returning the original
+    // id/seq and NOT re-inserting or re-fan-out, so the recipient never sees
+    // a duplicate.
+    const e = new SimClient(port, 'node-e', 'erin-pc');
+    const f = new SimClient(port, 'node-f', 'frank-pc');
+    await e.hello();
+    await f.hello();
+    const cmid = 'c-test-1735'; // deterministic for the assertion below
+    e.send({
+      type: 'msg',
+      from: 'node-e',
+      to: 'node-f',
+      ts: 1735000000000,
+      payload: { text: 'idempotency-1', clientMessageId: cmid },
+    });
+    const ack1 = await e.waitFor(
+      (fr) => fr.type === 'ack' && fr.payload?.['ok'] === true && fr.payload?.['clientMessageId'] === cmid,
+    );
+    const firstId = ack1.payload?.['id'];
+    const firstSeq = ack1.payload?.['seq'];
+    assert(
+      typeof firstId === 'number' && typeof firstSeq === 'number',
+      'ack echoes clientMessageId + id + seq',
+    );
+    const recv1 = await f.waitFor(
+      (fr) => fr.type === 'msg' && fr.payload?.['text'] === 'idempotency-1',
+    );
+    assert(recv1.payload?.['id'] === firstId, 'recipient got the message with matching id');
+    console.log('  ✓ ack echoes clientMessageId for precise matching');
+
+    // Resend the same (sender, clientMessageId): hub must return deduped:true
+    // with the ORIGINAL id/seq, and must NOT re-deliver to the recipient.
+    e.send({
+      type: 'msg',
+      from: 'node-e',
+      to: 'node-f',
+      ts: 1735000000000,
+      payload: { text: 'idempotency-1', clientMessageId: cmid },
+    });
+    const ack2 = await e.waitFor(
+      (fr) =>
+        fr.type === 'ack' &&
+        fr.payload?.['ok'] === true &&
+        fr.payload?.['clientMessageId'] === cmid,
+    );
+    assert(ack2.payload?.['deduped'] === true, 'resend is marked deduped');
+    assert(
+      ack2.payload?.['id'] === firstId && ack2.payload?.['seq'] === firstSeq,
+      'resend returns the original id/seq (no duplicate insert)',
+    );
+    // Give the hub a moment — if it had fanned-out, f would receive a second
+    // copy. Wait briefly and assert the inbox has no new idempotency-1 msg.
+    await sleep(150);
+    const dupCount = f.inbox.filter(
+      (fr) => fr.type === 'msg' && fr.payload?.['text'] === 'idempotency-1',
+    ).length;
+    assert(dupCount === 1, `resend did NOT re-deliver to recipient (got ${dupCount})`);
+    console.log('  ✓ resend with same clientMessageId is deduped (no duplicate)');
+
+    // A DIFFERENT clientMessageId must be treated as a brand-new message.
+    e.send({
+      type: 'msg',
+      from: 'node-e',
+      to: 'node-f',
+      ts: 1735000000001,
+      payload: { text: 'idempotency-2', clientMessageId: 'c-test-1736' },
+    });
+    const ack3 = await e.waitFor(
+      (fr) =>
+        fr.type === 'ack' &&
+        fr.payload?.['ok'] === true &&
+        fr.payload?.['clientMessageId'] === 'c-test-1736',
+    );
+    assert(
+      ack3.payload?.['id'] !== firstId && ack3.payload?.['deduped'] !== true,
+      'different clientMessageId inserts a new message',
+    );
+    console.log('  ✓ distinct clientMessageId creates a new message');
+
+    // Legacy clients (no clientMessageId) still work — the ack simply omits
+    // the field, and the client falls back to ts matching.
+    e.send({
+      type: 'msg',
+      from: 'node-e',
+      to: 'node-f',
+      ts: 1735000000002,
+      payload: { text: 'legacy-no-cmid' },
+    });
+    const ack4 = await e.waitFor(
+      (fr) => fr.type === 'ack' && fr.payload?.['ok'] === true && fr.payload?.['ts'] === 1735000000002,
+    );
+    assert(
+      typeof ack4.payload?.['clientMessageId'] !== 'string',
+      'legacy ack has no clientMessageId',
+    );
+    console.log('  ✓ legacy client (no clientMessageId) still works');
+
+    e.close();
+    f.close();
     a.close();
     a2.close();
     b2.close();
     bPhone.close();
+    c.close();
+    d.close();
     console.log('\nALL SIM CHECKS PASSED ✓');
   } finally {
     await hub.stop();

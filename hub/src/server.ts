@@ -33,6 +33,16 @@ interface Session {
   pingOutstanding: boolean;
 }
 
+interface IdempotentEntry {
+  id: number;
+  seq: number;
+  ts: number;
+  roomId: string | null;
+  recipient: string | null;
+  /** Epoch ms when this entry expires (24h after first insertion). */
+  expiresAt: number;
+}
+
 export class Hub {
   readonly options: Required<HubOptions>;
   private readonly store: Store;
@@ -44,6 +54,16 @@ export class Hub {
   private server?: ReturnType<typeof createServer>;
   private heartbeat?: NodeJS.Timeout;
   private startedPort = 0;
+
+  // Phase 1.3 idempotency: (sender, clientMessageId) -> {id, seq, ts}.
+  // A resend (e.g. after the client's 15s ack timeout) reuses the same
+  // clientMessageId; the hub returns the original id/seq instead of
+  // re-inserting and re-fan-out, so the recipient never sees a duplicate.
+  // 24h TTL matches DESIGN §1.3. In-memory only: a hub restart drops it,
+  // but a restart also drops the live socket so the client reconnects and
+  // pulls history (deduped by hub id) — it never resends post-restart.
+  private readonly idempotent = new Map<string, IdempotentEntry>();
+  private static readonly IDEMPOTENT_TTL_MS = 24 * 60 * 60 * 1000;
 
   constructor(options: HubOptions = {}) {
     this.options = {
@@ -98,12 +118,36 @@ export class Hub {
       for (const session of set) session.socket.destroy();
     }
     this.sessions.clear();
+    this.idempotent.clear();
     this.store.close();
     if (this.heartbeat) clearInterval(this.heartbeat);
     return new Promise((resolve) => {
       if (!this.server) return resolve();
       this.server.close(() => resolve());
     });
+  }
+
+  // ─── Phase 1.3 idempotency ──────────────────────────────────────────
+  // Keyed by `${sender}:${clientMessageId}`. Returns the cached insert
+  // result if the same clientMessageId is reused within 24h, so a resend
+  // (after the client's ack timeout) doesn't produce a duplicate row or a
+  // duplicate fan-out. Expired entries are purged lazily on read/write.
+  private idempotentKey(sender: string, clientMessageId: string): string {
+    return `${sender}:${clientMessageId}`;
+  }
+
+  private idempotentGet(sender: string, clientMessageId: string): IdempotentEntry | null {
+    const entry = this.idempotent.get(this.idempotentKey(sender, clientMessageId));
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+      this.idempotent.delete(this.idempotentKey(sender, clientMessageId));
+      return null;
+    }
+    return entry;
+  }
+
+  private idempotentSet(sender: string, clientMessageId: string, entry: IdempotentEntry): void {
+    this.idempotent.set(this.idempotentKey(sender, clientMessageId), entry);
   }
 
   // ─── connection handling ───────────────────────────────────────────
@@ -243,7 +287,7 @@ export class Hub {
         to: nodeId,
         roomId: m.roomId ?? undefined,
         ts: m.ts,
-        payload: { ...m.payload, queued: true, id: m.id },
+        payload: { ...m.payload, queued: true, id: m.id, seq: m.seq },
       });
     }
     if (queued.length > 0 && set.size === 1) {
@@ -288,21 +332,55 @@ export class Hub {
     }
     const ts = frame.ts ?? Date.now();
     const payload = frame.payload ?? {};
+    // Phase 1.3 idempotency: a resend (client's 15s ack timeout fired but
+    // the hub already inserted) reuses the same clientMessageId. Return the
+    // original id/seq and skip both insert and fan-out so the recipient
+    // never sees a duplicate.
+    const clientMessageId = readClientMessageId(payload);
+    if (clientMessageId) {
+      const cached = this.idempotentGet(sender, clientMessageId);
+      if (cached) {
+        this.send(session, {
+          type: 'ack',
+          to: sender,
+          ts: cached.ts,
+          payload: {
+            ok: true,
+            ts: cached.ts,
+            id: cached.id,
+            seq: cached.seq,
+            clientMessageId,
+            deduped: true,
+          },
+        });
+        return;
+      }
+    }
     // Authoritative storage: persist EVERY 1:1 message (VPS role), then
     // deliver live or queue for the offline recipient. `id` lets clients
     // dedup history against what they already have locally.
-    const id = this.store.insert(
+    const { id, seq } = this.store.insert(
       { roomId: null, sender, recipient, payload, ts },
       this.sessions.has(recipient),
     );
+    if (clientMessageId) {
+      this.idempotentSet(sender, clientMessageId, {
+        id,
+        seq,
+        ts,
+        roomId: null,
+        recipient,
+        expiresAt: Date.now() + Hub.IDEMPOTENT_TTL_MS,
+      });
+    }
     // Deliver to EVERY session of the recipient (all their devices), and also
     // to the sender's other sessions so their own devices see it live.
     const targets = this.sessionsOf(recipient);
     for (const t of targets) {
-      this.send(t, { type: 'msg', from: sender, to: recipient, ts, payload: { ...payload, id } });
+      this.send(t, { type: 'msg', from: sender, to: recipient, ts, payload: { ...payload, id, seq } });
     }
     for (const t of this.sessionsOf(sender)) {
-      if (t !== session) this.send(t, { type: 'msg', from: sender, to: recipient, ts, payload: { ...payload, id } });
+      if (t !== session) this.send(t, { type: 'msg', from: sender, to: recipient, ts, payload: { ...payload, id, seq } });
     }
     if (targets.length === 0) {
       console.log(`[hub] queued msg ${sender} -> ${recipient}`);
@@ -310,7 +388,7 @@ export class Hub {
     this.send(session, {
       type: 'ack',
       to: sender,
-      payload: { ok: true, ts, id },
+      payload: { ok: true, ts, id, seq, ...(clientMessageId ? { clientMessageId } : {}) },
     });
   }
 
@@ -318,8 +396,20 @@ export class Hub {
     const nodeId = session.nodeId;
     if (!nodeId) return;
     const limit = (frame.payload?.['limit'] as number | undefined) ?? 200;
-    // Full history: 1:1 in both directions + the node's room messages.
-    const messages = this.store.historyFor(nodeId, this.router.roomsOf(nodeId), limit);
+    // Incremental sync (Phase 1.2): client sends `after: {convId: lastSeq}`
+    // on reconnect/refresh; the hub returns only newer messages per thread.
+    const afterRaw = frame.payload?.['after'];
+    const after =
+      typeof afterRaw === 'object' && afterRaw !== null
+        ? Object.fromEntries(
+            Object.entries(afterRaw as Record<string, unknown>).filter(
+              (entry): entry is [string, number] => typeof entry[1] === 'number',
+            ),
+          )
+        : undefined;
+    const messages = after
+      ? this.store.incrementalFor(nodeId, this.router.roomsOf(nodeId), after, limit)
+      : this.store.historyFor(nodeId, this.router.roomsOf(nodeId), limit);
     // `initial` marks the connect-time backlog so clients can suppress
     // notification spam for old messages (only live/queued-flush notify).
     this.send(session, {
@@ -394,12 +484,46 @@ export class Hub {
     if (!sender || !roomId) return;
     const ts = frame.ts ?? Date.now();
     const payload = frame.payload ?? {};
+    // Phase 1.3 idempotency: same contract as 1:1 messages — a resend with
+    // the same clientMessageId returns the original id/seq and skips both
+    // the insert and the fan-out.
+    const clientMessageId = readClientMessageId(payload);
+    if (clientMessageId) {
+      const cached = this.idempotentGet(sender, clientMessageId);
+      if (cached) {
+        this.send(session, {
+          type: 'ack',
+          to: sender,
+          roomId,
+          ts: cached.ts,
+          payload: {
+            ok: true,
+            ts: cached.ts,
+            id: cached.id,
+            seq: cached.seq,
+            clientMessageId,
+            deduped: true,
+          },
+        });
+        return;
+      }
+    }
     // Persist room messages too (authoritative history). recipient = roomId
     // so 1:1 history queries never match them.
-    const id = this.store.insert(
+    const { id, seq } = this.store.insert(
       { roomId, sender, recipient: roomId, payload, ts },
       true,
     );
+    if (clientMessageId) {
+      this.idempotentSet(sender, clientMessageId, {
+        id,
+        seq,
+        ts,
+        roomId,
+        recipient: roomId,
+        expiresAt: Date.now() + Hub.IDEMPOTENT_TTL_MS,
+      });
+    }
     // Deliver to every session of every member (multi-device), including the
     // sender's own other devices so their copies stay in sync live.
     for (const member of this.router.roomMembers(roomId)) {
@@ -410,7 +534,7 @@ export class Hub {
             from: sender,
             roomId,
             ts,
-            payload: { ...payload, id },
+            payload: { ...payload, id, seq },
           });
         }
       }
@@ -419,7 +543,7 @@ export class Hub {
       type: 'ack',
       to: sender,
       roomId,
-      payload: { ok: true, ts, id },
+      payload: { ok: true, ts, id, seq, ...(clientMessageId ? { clientMessageId } : {}) },
     });
   }
 
@@ -544,6 +668,14 @@ export class Hub {
 // TailscaleIPs (plain IPv4 / IPv6 strings) match.
 function normalizeRemoteIp(ip: string): string {
   return ip.startsWith('::ffff:') ? ip.slice('::ffff:'.length) : ip;
+}
+
+// Phase 1.3: extracts the client-supplied idempotency key from a msg/room/msg
+// payload. Returns null for legacy clients (no clientMessageId) so the hub
+// stays backwards-compatible — those messages go through the original path.
+function readClientMessageId(payload: Record<string, unknown>): string | null {
+  const v = payload['clientMessageId'];
+  return typeof v === 'string' && v.length > 0 ? v : null;
 }
 
 // ─── standalone entry point ──────────────────────────────────────────
