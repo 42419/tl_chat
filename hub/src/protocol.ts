@@ -4,7 +4,7 @@
 // Frame shape: { type, from, to, roomId, ts, payload }
 //   type: hello | ping | pong | bye | msg | offline | read | ack |
 //         room/create | room/join | room/leave | room/msg | room/list |
-//         room/members | conv/clear | presence
+//         room/members | conv/clear | presence | typing
 
 export interface ChatFrame {
   type: string;

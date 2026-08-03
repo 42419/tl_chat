@@ -214,6 +214,8 @@ export class Hub {
         return this.onRoomMembers(session, frame);
       case 'conv/clear':
         return void this.onConversationClear(session, frame);
+      case 'typing':
+        return void this.onTyping(session, frame);
       default:
         this.send(session, {
           type: 'ack',
@@ -433,6 +435,48 @@ export class Hub {
         ts: frame.ts,
         payload: frame.payload ?? {},
       });
+    }
+  }
+
+  // Phase 2.1 typing indicator. The hub is a pure relay — typing state is
+  // ephemeral and NEVER persisted (per DESIGN §1.6). Two routing shapes:
+  //   1:1 (no roomId): forward to every session of `to` (the peer node).
+  //   room (roomId set): forward to every session of every member EXCEPT the
+  //     sender's own sessions (the sender's own devices don't need their own
+  //     "typing" echo — unlike msgs, typing is not mirrored back to the sender).
+  // No ack is sent: typing is fire-and-forget; a lost frame simply means the
+  // indicator doesn't show, which is acceptable for a best-effort signal.
+  private onTyping(session: Session, frame: ChatFrame): void {
+    const sender = session.nodeId;
+    if (!sender) return;
+    const isStop = frame.payload?.['stop'] === true;
+    const payload = { ...frame.payload, stop: isStop };
+    const ts = frame.ts ?? Date.now();
+    if (frame.roomId) {
+      for (const member of this.router.roomMembers(frame.roomId)) {
+        if (member === sender) continue;
+        for (const t of this.sessionsOf(member)) {
+          this.send(t, {
+            type: 'typing',
+            from: sender,
+            roomId: frame.roomId,
+            ts,
+            payload,
+          });
+        }
+      }
+    } else {
+      const recipient = frame.to;
+      if (!recipient) return;
+      for (const t of this.sessionsOf(recipient)) {
+        this.send(t, {
+          type: 'typing',
+          from: sender,
+          to: recipient,
+          ts,
+          payload,
+        });
+      }
     }
   }
 

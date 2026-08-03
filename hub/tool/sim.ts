@@ -483,6 +483,91 @@ async function main(): Promise<void> {
     assert(offlineRecv.payload?.['id'] === offlineAck.payload?.['id'], 'recipient got the offline-queued message');
     console.log('  ✓ offline-queued flush (new clientMessageId) is a fresh insert');
 
+    // Phase 2.1: typing indicator. The hub is a pure relay — it must forward
+    // `typing` frames to the peer (1:1) or every room member except the sender
+    // (room), without persisting and without acking. A `stop` frame must
+    // likewise be forwarded so the peer's indicator clears immediately.
+    //
+    // 1:1 typing: g -> h, h should receive exactly one `typing` frame with
+    // stop:false, then one with stop:true after g sends a stop.
+    const t1 = new SimClient(port, 'node-t1', 'tom-pc');
+    const t2 = new SimClient(port, 'node-t2', 'tina-pc');
+    await t1.hello();
+    await t2.hello();
+    t1.send({
+      type: 'typing',
+      from: 'node-t1',
+      to: 'node-t2',
+      ts: 1735000000020,
+      payload: { stop: false },
+    });
+    const typingRecv = await t2.waitFor((fr) => fr.type === 'typing' && fr.from === 'node-t1');
+    assert(typingRecv.payload?.['stop'] === false, '1:1 typing forwarded with stop:false');
+    assert(typingRecv.to === 'node-t2', '1:1 typing routed to the peer');
+    console.log('  ✓ 1:1 typing frame forwarded to peer');
+
+    // stop frame: forwarded, clears the peer's indicator.
+    t1.send({
+      type: 'typing',
+      from: 'node-t1',
+      to: 'node-t2',
+      ts: 1735000000021,
+      payload: { stop: true },
+    });
+    const stopRecv = await t2.waitFor(
+      (fr) => fr.type === 'typing' && fr.from === 'node-t1' && fr.payload?.['stop'] === true,
+    );
+    assert(stopRecv.payload?.['stop'] === true, '1:1 typing stop forwarded with stop:true');
+    console.log('  ✓ 1:1 typing stop forwarded to peer');
+
+    // Room typing: t1 in a room with t2 and a third member t3. t1's typing
+    // must reach t2 AND t3 but NOT echo back to t1.
+    const t3 = new SimClient(port, 'node-t3', 'ted-pc');
+    await t3.hello();
+    const roomName = 'typing-room';
+    t1.send({
+      type: 'room/create',
+      from: 'node-t1',
+      payload: { name: roomName },
+    });
+    const createAck = await t1.waitFor((fr) => fr.type === 'ack' && fr.payload?.['ok'] === true && Boolean(fr.payload?.['roomId']));
+    const typingRoomId = createAck.payload?.['roomId'] as string;
+    for (const who of [t2, t3]) {
+      who.send({ type: 'room/join', from: who.nodeId, roomId: typingRoomId });
+      await who.waitFor((fr) => fr.type === 'ack' && fr.payload?.['joined'] === true);
+    }
+    // t1 must also join (room/create auto-joins the owner, but be explicit
+    // for the membership check below).
+    t1.send({ type: 'room/join', from: 'node-t1', roomId: typingRoomId });
+    await t1.waitFor((fr) => fr.type === 'ack' && fr.payload?.['roomId'] === typingRoomId);
+
+    t1.send({
+      type: 'typing',
+      from: 'node-t1',
+      roomId: typingRoomId,
+      ts: 1735000000030,
+      payload: { stop: false },
+    });
+    const t2Got = await t2.waitFor(
+      (fr) => fr.type === 'typing' && fr.from === 'node-t1' && fr.roomId === typingRoomId,
+    );
+    const t3Got = await t3.waitFor(
+      (fr) => fr.type === 'typing' && fr.from === 'node-t1' && fr.roomId === typingRoomId,
+    );
+    assert(t2Got.payload?.['stop'] === false, 'room typing forwarded to member t2');
+    assert(t3Got.payload?.['stop'] === false, 'room typing forwarded to member t3');
+    // Give t1 a moment — if the hub had echoed back, t1 would have a typing
+    // frame in its inbox. Assert it does NOT.
+    await sleep(150);
+    const t1Echo = t1.inbox.filter(
+      (fr) => fr.type === 'typing' && fr.from === 'node-t1',
+    ).length;
+    assert(t1Echo === 0, 'room typing NOT echoed back to the sender');
+    console.log('  ✓ room typing forwarded to all members except sender');
+
+    t1.close();
+    t2.close();
+    t3.close();
     g.close();
     h.close();
     e.close();

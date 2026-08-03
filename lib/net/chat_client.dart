@@ -275,6 +275,21 @@ class ChatClient extends ChangeNotifier {
   /// bump its unread counter. Set by the chat page, cleared on close.
   String? activeConversationId;
 
+  // ─── typing indicator (Phase 2.1) ───────────────────────────────────
+  // Inbound: per-conversation set of nodeIds currently "typing". Drives the
+  //   「正在输入…」 subtitle in the chat header. Each entry owns a 5s TTL
+  //   timer — if the peer doesn't send another `typing` frame (or a `stop`)
+  //   within 5s, the indicator clears itself (DESIGN §1.6 TTL兜底,防幽灵输入).
+  // Outbound: a single debounce timer per conversation — the user must pause
+  //   for ~3s (or send/lose focus) before we re-send a `typing` frame, so we
+  //   don't spam the hub on every keystroke.
+  final Map<String, Set<String>> _typingSenders = {};
+  final Map<String, Map<String, Timer>> _typingTtls = {};
+  final Map<String, Timer> _typingDebounce = {};
+  final Set<String> _typingActive = {}; // conversations with an active outbound typing state
+  static const Duration _typingDebounceDelay = Duration(seconds: 3);
+  static const Duration _typingTtl = Duration(seconds: 5);
+
   bool get connected => _connected;
 
   ConnectionPhase get phase => _phase;
@@ -569,6 +584,9 @@ class ChatClient extends ChangeNotifier {
       case 'read':
         _onReadReceipt(frame);
         break;
+      case 'typing':
+        _onTyping(frame);
+        break;
       case 'bye':
         _onDisconnected();
         break;
@@ -797,6 +815,16 @@ class ChatClient extends ChangeNotifier {
       hubId: hubId,
       seq: seq,
     );
+    // Phase 2.1: a real message arrived from this sender — they stopped
+    // typing. Clear their inbound typing state so the header subtitle
+    // switches back to the online/offline line immediately.
+    if (!msg.isMine) {
+      final ttls = _typingTtls[threadId];
+      if (ttls != null) {
+        ttls.remove(from)?.cancel();
+      }
+      _typingSenders[threadId]?.remove(from);
+    }
     conv.messages.add(msg);
     conv.lastMessage = msg;
     if (seq != null && seq > conv.lastSeq) conv.lastSeq = seq;
@@ -943,6 +971,116 @@ class ChatClient extends ChangeNotifier {
       }
     }
     if (changed) notifyListeners();
+  }
+
+  // ─── Phase 2.1 typing indicator ─────────────────────────────────────
+
+  /// Inbound `typing` frame from a peer. Adds the sender to this
+  /// conversation's typing set and arms a 5s TTL — if no fresh `typing`
+  /// frame arrives in 5s (or a `stop` arrives), the sender is dropped and
+  /// the UI subtitle clears. A `stop` frame clears immediately.
+  void _onTyping(ChatFrame frame) {
+    final from = frame.from;
+    if (from == null || from == _myNodeId) return;
+    final convId = frame.roomId ?? frame.from;
+    if (convId == null) return;
+    final isStop = frame.payload?['stop'] == true;
+    final ttls = _typingTtls.putIfAbsent(convId, () => {});
+    if (isStop) {
+      ttls.remove(from)?.cancel();
+      _typingSenders[convId]?.remove(from);
+    } else {
+      _typingSenders.putIfAbsent(convId, () => {}).add(from);
+      ttls[from]?.cancel();
+      ttls[from] = Timer(_typingTtl, () {
+        ttls.remove(from);
+        _typingSenders[convId]?.remove(from);
+        notifyListeners();
+      });
+    }
+    notifyListeners();
+  }
+
+  /// Returns true if any peer is currently typing in this conversation.
+  bool isTyping(String conversationId) =>
+      (_typingSenders[conversationId]?.isNotEmpty ?? false);
+
+  /// Returns the nodeIds of peers currently typing in a conversation
+  /// (for showing "Alice 正在输入…" with a real name).
+  Set<String> typingSenders(String conversationId) =>
+      Set.unmodifiable(_typingSenders[conversationId] ?? const {});
+
+  /// Called by the chat page on every keystroke. Sends a `typing` frame at
+  /// most once per 3s (debounce) — continuous typing re-arms the debounce,
+  /// so a steady stream of keystrokes produces one outbound frame every 3s
+  /// max, not one per keystroke. The hub forwards it fire-and-forget.
+  void onTypingKeystroke(String conversationId, {bool isRoom = false}) {
+    if (!_connected || _myNodeId == null) return;
+    // Re-arm the debounce: only fire after the user pauses for 3s, OR send
+    // immediately if we haven't sent a typing frame for this conv yet.
+    final alreadyActive = _typingActive.contains(conversationId);
+    _typingDebounce[conversationId]?.cancel();
+    if (alreadyActive) {
+      _typingDebounce[conversationId] = Timer(
+        _typingDebounceDelay,
+        () => _sendTypingFrame(conversationId, isRoom: isRoom),
+      );
+    } else {
+      _sendTypingFrame(conversationId, isRoom: isRoom);
+      _typingActive.add(conversationId);
+    }
+  }
+
+  void _sendTypingFrame(String conversationId, {required bool isRoom}) {
+    if (!_connected || _myNodeId == null) return;
+    _write(
+      ChatFrame(
+        type: 'typing',
+        from: _myNodeId,
+        to: isRoom ? null : conversationId,
+        roomId: isRoom ? conversationId : null,
+        ts: DateTime.now().millisecondsSinceEpoch,
+        payload: const {'stop': false},
+      ),
+    );
+  }
+
+  /// Stops the outbound typing indicator for a conversation — sent on send,
+  /// focus loss, or page dispose. Clears the debounce timer and the active
+  /// flag, and emits a `typing {stop:true}` frame so the peer's UI clears
+  /// immediately instead of waiting for the 5s TTL.
+  void stopTyping(String conversationId, {bool isRoom = false}) {
+    _typingDebounce[conversationId]?.cancel();
+    _typingDebounce.remove(conversationId);
+    if (!_typingActive.remove(conversationId)) return;
+    if (!_connected || _myNodeId == null) return;
+    _write(
+      ChatFrame(
+        type: 'typing',
+        from: _myNodeId,
+        to: isRoom ? null : conversationId,
+        roomId: isRoom ? conversationId : null,
+        ts: DateTime.now().millisecondsSinceEpoch,
+        payload: const {'stop': true},
+      ),
+    );
+  }
+
+  /// Cancels all typing timers (inbound TTLs + outbound debounce) — used on
+  /// disconnect/teardown so no stale timer fires post-teardown.
+  void _clearTypingTimers() {
+    for (final ttls in _typingTtls.values) {
+      for (final t in ttls.values) {
+        t.cancel();
+      }
+    }
+    _typingTtls.clear();
+    _typingSenders.clear();
+    for (final t in _typingDebounce.values) {
+      t.cancel();
+    }
+    _typingDebounce.clear();
+    _typingActive.clear();
   }
 
   void _onDisconnected() {
@@ -1532,6 +1670,7 @@ class ChatClient extends ChangeNotifier {
     _pongTimeout?.cancel();
     _pongTimeout = null;
     _markPendingUnsent();
+    _clearTypingTimers();
     _inputSub?.cancel();
     _inputSub = null;
     _conn?.close();
