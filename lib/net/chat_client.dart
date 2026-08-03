@@ -507,6 +507,11 @@ class ChatClient extends ChangeNotifier {
       // 群名不随历史消息下发：连接后主动拉一次群列表，让 _onRoomList 把
       // 重建会话的标题从 roomId 修正为真实群名（清缓存重登后群名不再丢失）。
       unawaited(listRooms().then<void>((_) {}, onError: (_) {}));
+      // Phase 1.4: flush any messages that were queued while offline or
+      // left in-flight when the previous connection dropped. Re-uses each
+      // message's original clientMessageId so the hub dedupes — safe even
+      // if a previous write actually landed but its ack was lost.
+      _flushPending();
       _statusText = '已连接';
       _phase = ConnectionPhase.connected;
       _startHeartbeat();
@@ -662,7 +667,7 @@ class ChatClient extends ChangeNotifier {
 
       if (ackClientMessageId != null) {
         final pending = _pending.remove(ackClientMessageId);
-        pending?.timer.cancel();
+        pending?.timer?.cancel();
         final conv = pending != null
             ? _conversations[pending.convId]
             : null;
@@ -998,10 +1003,15 @@ class ChatClient extends ChangeNotifier {
   }
 
   /// Sends a 1:1 text message. Returns the message for optimistic UI.
+  ///
+  /// Phase 1.4: works offline too — the message is added locally as `sending`
+  /// and queued (no ack timeout armed); the next successful reconnect
+  /// flushes it. The hub's `(sender, clientMessageId)` idempotency map makes
+  /// a re-send after a dropped-ack safe (no duplicate row / fan-out).
   ChatMessage sendMessage(String to, String text) {
     final trimmed = text.trim();
-    if (trimmed.isEmpty || !_connected) {
-      throw const HubException('未连接');
+    if (trimmed.isEmpty) {
+      throw const HubException('空消息');
     }
     final ts = DateTime.now().millisecondsSinceEpoch;
     final clientMessageId = _newClientMessageId(ts);
@@ -1021,26 +1031,41 @@ class ChatClient extends ChangeNotifier {
     conv.messages.add(msg);
     conv.lastMessage = msg;
     _persist(conv);
-    _trackPending(
-      convId: to,
-      isRoom: false,
-      targetId: to,
-      clientMessageId: clientMessageId,
-      ts: ts,
-    );
-    _write(
-      ChatFrame(
-        type: 'msg',
-        from: _myNodeId,
-        to: to,
+    if (_connected && _myNodeId != null) {
+      _trackPending(
+        convId: to,
+        isRoom: false,
+        targetId: to,
+        clientMessageId: clientMessageId,
         ts: ts,
-        payload: {
-          'text': trimmed,
-          'hostname': _hostname ?? '',
-          'clientMessageId': clientMessageId,
-        },
-      ),
-    );
+        wireSent: true,
+      );
+      _write(
+        ChatFrame(
+          type: 'msg',
+          from: _myNodeId,
+          to: to,
+          ts: ts,
+          payload: {
+            'text': trimmed,
+            'hostname': _hostname ?? '',
+            'clientMessageId': clientMessageId,
+          },
+        ),
+      );
+    } else {
+      // Offline: queue locally without arming the ack timeout. The next
+      // successful reconnect's _flushPending will write it to the wire and
+      // arm the timeout then.
+      _trackPending(
+        convId: to,
+        isRoom: false,
+        targetId: to,
+        clientMessageId: clientMessageId,
+        ts: ts,
+        wireSent: false,
+      );
+    }
     notifyListeners();
     return msg;
   }
@@ -1109,7 +1134,7 @@ class ChatClient extends ChangeNotifier {
 
   void sendRoomMessage(String roomId, String text) {
     final trimmed = text.trim();
-    if (trimmed.isEmpty || !_connected) return;
+    if (trimmed.isEmpty) return;
     final ts = DateTime.now().millisecondsSinceEpoch;
     final clientMessageId = _newClientMessageId(ts);
     final msg = ChatMessage(
@@ -1128,26 +1153,39 @@ class ChatClient extends ChangeNotifier {
       conv.lastMessage = msg;
       _persist(conv);
     }
-    _trackPending(
-      convId: roomId,
-      isRoom: true,
-      targetId: roomId,
-      clientMessageId: clientMessageId,
-      ts: ts,
-    );
-    _write(
-      ChatFrame(
-        type: 'room/msg',
-        from: _myNodeId,
-        roomId: roomId,
+    if (_connected && _myNodeId != null) {
+      _trackPending(
+        convId: roomId,
+        isRoom: true,
+        targetId: roomId,
+        clientMessageId: clientMessageId,
         ts: ts,
-        payload: {
-          'text': trimmed,
-          'hostname': _hostname ?? '',
-          'clientMessageId': clientMessageId,
-        },
-      ),
-    );
+        wireSent: true,
+      );
+      _write(
+        ChatFrame(
+          type: 'room/msg',
+          from: _myNodeId,
+          roomId: roomId,
+          ts: ts,
+          payload: {
+            'text': trimmed,
+            'hostname': _hostname ?? '',
+            'clientMessageId': clientMessageId,
+          },
+        ),
+      );
+    } else {
+      // Offline: queue locally, flush on the next reconnect (Phase 1.4).
+      _trackPending(
+        convId: roomId,
+        isRoom: true,
+        targetId: roomId,
+        clientMessageId: clientMessageId,
+        ts: ts,
+        wireSent: false,
+      );
+    }
     notifyListeners();
   }
 
@@ -1274,24 +1312,33 @@ class ChatClient extends ChangeNotifier {
   }
 
   /// Registers an outgoing message as awaiting ack and arms its 15s timeout.
+  ///
+  /// [wireSent] (Phase 1.4): true when the frame has just been written to the
+  /// socket (the normal online path) — arms the 15s ack timeout. false when
+  /// the message is being queued offline (no socket yet) OR was sent on a
+  /// connection that has since dropped — in that case no timeout is armed;
+  /// the next successful reconnect flushes it via [_flushPending].
   void _trackPending({
     required String convId,
     required bool isRoom,
     required String targetId,
     required String clientMessageId,
     required int ts,
+    required bool wireSent,
   }) {
     // Cancel any stale entry for the same key first (defensive — should not
     // happen because clientMessageId is unique per send).
-    _pending[clientMessageId]?.timer.cancel();
-    final timer = Timer(_ackTimeout, () => _onAckTimeout(clientMessageId));
+    _pending[clientMessageId]?.timer?.cancel();
     _pending[clientMessageId] = _PendingSend(
       convId: convId,
       isRoom: isRoom,
       targetId: targetId,
       clientMessageId: clientMessageId,
       ts: ts,
-      timer: timer,
+      timer: wireSent
+          ? Timer(_ackTimeout, () => _onAckTimeout(clientMessageId))
+          : null,
+      wireSent: wireSent,
     );
   }
 
@@ -1319,16 +1366,71 @@ class ChatClient extends ChangeNotifier {
     }
   }
 
-  /// Cancels every pending ack-timeout without touching the message status —
-  /// used on disconnect/teardown. The messages stay in `sending` so the UI
-  /// shows them as in-flight; Phase 1.4 will turn this into offline queueing
-  /// + reconnect flush. Timers are cancelled so they don't fire post-teardown
-  /// and incorrectly mark a message failed while the socket is gone.
-  void _clearPendingTimers() {
+  /// Disconnect/teardown hook (Phase 1.4): cancels every armed ack-timeout
+  /// and marks all in-flight sends as `wireSent=false` so the next
+  /// successful reconnect flushes them. Messages stay `sending` in the UI
+  /// (no false "failed"), and timers are cancelled so they don't fire
+  /// post-teardown and wrongly flip a message to failed.
+  ///
+  /// The hub's `(sender, clientMessageId)` idempotency map makes the
+  /// re-send on reconnect safe even if the original write actually reached
+  /// the hub but the ack was lost in the drop.
+  void _markPendingUnsent() {
     for (final p in _pending.values) {
-      p.timer.cancel();
+      p.timer?.cancel();
+      p.timer = null;
+      p.wireSent = false;
     }
-    _pending.clear();
+  }
+
+  /// Phase 1.4: re-sends every queued (wireSent=false) pending message
+  /// after a successful reconnect, arming their 15s ack timeouts. Called
+  /// once at the tail of [connect]. Order is preserved by iterating the
+  /// insertion-order map.
+  void _flushPending() {
+    if (_pending.isEmpty) return;
+    for (final p in _pending.values) {
+      if (p.wireSent) continue;
+      final payload = <String, dynamic>{
+        'text': _textForPending(p),
+        'hostname': _hostname ?? '',
+        'clientMessageId': p.clientMessageId,
+      };
+      if (p.isRoom) {
+        _write(
+          ChatFrame(
+            type: 'room/msg',
+            from: _myNodeId,
+            roomId: p.targetId,
+            ts: p.ts,
+            payload: payload,
+          ),
+        );
+      } else {
+        _write(
+          ChatFrame(
+            type: 'msg',
+            from: _myNodeId,
+            to: p.targetId,
+            ts: p.ts,
+            payload: payload,
+          ),
+        );
+      }
+      p.wireSent = true;
+      p.timer = Timer(_ackTimeout, () => _onAckTimeout(p.clientMessageId));
+    }
+  }
+
+  /// Looks up the message text for a pending send (best-effort: the message
+  /// may have been removed from the conversation, in which case we skip it).
+  String _textForPending(_PendingSend p) {
+    final conv = _conversations[p.convId];
+    if (conv == null) return '';
+    for (final m in conv.messages) {
+      if (m.clientMessageId == p.clientMessageId) return m.text;
+    }
+    return '';
   }
 
   /// Long-press「重发」entry point: re-sends a failed message using its
@@ -1356,6 +1458,7 @@ class ChatClient extends ChangeNotifier {
       targetId: target.roomId ?? conversationId,
       clientMessageId: clientMessageId,
       ts: target.ts,
+      wireSent: true,
     );
     final payload = <String, dynamic>{
       'text': target.text,
@@ -1401,7 +1504,7 @@ class ChatClient extends ChangeNotifier {
     final cmid = removed.clientMessageId;
     if (cmid != null) {
       final pending = _pending.remove(cmid);
-      pending?.timer.cancel();
+      pending?.timer?.cancel();
     }
     // Patch lastMessage if we just removed the tail.
     if (conv.lastMessage?.id == messageId) {
@@ -1428,7 +1531,7 @@ class ChatClient extends ChangeNotifier {
     _heartbeatTimer = null;
     _pongTimeout?.cancel();
     _pongTimeout = null;
-    _clearPendingTimers();
+    _markPendingUnsent();
     _inputSub?.cancel();
     _inputSub = null;
     _conn?.close();
@@ -1464,6 +1567,14 @@ class ChatClient extends ChangeNotifier {
 /// hub echoes `clientMessageId` back in its ack, which is how the client
 /// matches the ack to this exact pending send (replacing the old "flip every
 /// sending message to sent" broadcast).
+///
+/// Phase 1.4 added [wireSent]: false while the message has NOT yet been put
+/// on the wire (sent while offline, or a drop happened before the ack). Such
+/// entries have NO timeout armed — they wait for the next successful
+/// reconnect, at which point [_ChatClient._flushPending] re-sends them and
+/// flips `wireSent` to true (arming the timeout then). The hub's
+/// `(sender, clientMessageId)` idempotency map makes a re-send safe even if
+/// the original write actually reached the hub but the ack was lost.
 class _PendingSend {
   _PendingSend({
     required this.convId,
@@ -1472,6 +1583,7 @@ class _PendingSend {
     required this.clientMessageId,
     required this.ts,
     required this.timer,
+    required this.wireSent,
   });
 
   /// Conversation the message lives in (1:1 nodeId or room id).
@@ -1490,5 +1602,11 @@ class _PendingSend {
   final int ts;
 
   /// 15s ack-timeout timer. On fire, the message flips to failed.
-  Timer timer;
+  /// `null` while [wireSent] is false (waiting for reconnect flush).
+  Timer? timer;
+
+  /// False until the frame has actually been written to the socket. Pending
+  /// entries with `wireSent == false` are re-sent on the next successful
+  /// reconnect (Phase 1.4 offline queueing + flush).
+  bool wireSent;
 }

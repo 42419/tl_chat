@@ -1339,13 +1339,9 @@ class _ChatPageState extends State<ChatPage> {
   void _send() {
     final text = _composer.text;
     if (text.trim().isEmpty) return;
-    if (!widget.client.connected) {
-      // Offline browsing: cached history is readable, sending is not.
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('未连接，无法发送消息')));
-      return;
-    }
+    // Phase 1.4: sending works offline too — the message lands locally as
+    // `sending` and is flushed automatically on the next reconnect. The hub's
+    // clientMessageId idempotency map makes the re-send safe.
     try {
       if (widget.conversation.isRoom) {
         widget.client.sendRoomMessage(widget.conversation.id, text);

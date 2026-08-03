@@ -405,6 +405,86 @@ async function main(): Promise<void> {
     );
     console.log('  ✓ legacy client (no clientMessageId) still works');
 
+    // Phase 1.4: reconnect flush. A client that drops mid-flight (or sent
+    // while offline) re-sends its queued message with the SAME
+    // clientMessageId on the next reconnect. The hub's idempotency map must
+    // treat it as a dedup IF the original write landed, and as a fresh
+    // insert otherwise — either way the recipient sees exactly one copy.
+    //
+    // Scenario: original write reached the hub and was delivered, but the
+    // ack was lost in the drop. The client doesn't know, so on reconnect it
+    // flushes the same clientMessageId. Hub must return deduped:true with
+    // the original id/seq and NOT re-deliver to the recipient.
+    const g = new SimClient(port, 'node-g', 'grace-pc');
+    const h = new SimClient(port, 'node-h', 'henry-pc');
+    await g.hello();
+    await h.hello();
+    const flushCmid = 'c-flush-1';
+    g.send({
+      type: 'msg',
+      from: 'node-g',
+      to: 'node-h',
+      ts: 1735000000010,
+      payload: { text: 'flush-msg', clientMessageId: flushCmid },
+    });
+    const flushAck1 = await g.waitFor(
+      (fr) => fr.type === 'ack' && fr.payload?.['clientMessageId'] === flushCmid,
+    );
+    const flushId = flushAck1.payload?.['id'];
+    const flushSeq = flushAck1.payload?.['seq'];
+    await h.waitFor(
+      (fr) => fr.type === 'msg' && fr.payload?.['text'] === 'flush-msg',
+    );
+    // Simulate the drop + reconnect flush: same clientMessageId again.
+    g.send({
+      type: 'msg',
+      from: 'node-g',
+      to: 'node-h',
+      ts: 1735000000010,
+      payload: { text: 'flush-msg', clientMessageId: flushCmid },
+    });
+    const flushAck2 = await g.waitFor(
+      (fr) => fr.type === 'ack' && fr.payload?.['clientMessageId'] === flushCmid,
+    );
+    assert(flushAck2.payload?.['deduped'] === true, 'reconnect flush is deduped');
+    assert(
+      flushAck2.payload?.['id'] === flushId && flushAck2.payload?.['seq'] === flushSeq,
+      'reconnect flush returns the original id/seq',
+    );
+    await sleep(150);
+    const flushDups = h.inbox.filter(
+      (fr) => fr.type === 'msg' && fr.payload?.['text'] === 'flush-msg',
+    ).length;
+    assert(flushDups === 1, `reconnect flush did NOT re-deliver (got ${flushDups})`);
+    console.log('  ✓ reconnect flush with same clientMessageId is deduped (no duplicate)');
+
+    // Scenario: the client queued while fully offline (the write never
+    // reached the hub). On reconnect it flushes — the hub has never seen
+    // this clientMessageId, so it must insert + deliver normally.
+    const offlineCmid = 'c-offline-1';
+    g.send({
+      type: 'msg',
+      from: 'node-g',
+      to: 'node-h',
+      ts: 1735000000011,
+      payload: { text: 'offline-msg', clientMessageId: offlineCmid },
+    });
+    const offlineAck = await g.waitFor(
+      (fr) => fr.type === 'ack' && fr.payload?.['clientMessageId'] === offlineCmid,
+    );
+    assert(offlineAck.payload?.['deduped'] !== true, 'first flush of an offline-queued msg is a fresh insert');
+    assert(
+      typeof offlineAck.payload?.['id'] === 'number' && offlineAck.payload?.['id'] !== flushId,
+      'offline-queued flush gets a new hub id',
+    );
+    const offlineRecv = await h.waitFor(
+      (fr) => fr.type === 'msg' && fr.payload?.['text'] === 'offline-msg',
+    );
+    assert(offlineRecv.payload?.['id'] === offlineAck.payload?.['id'], 'recipient got the offline-queued message');
+    console.log('  ✓ offline-queued flush (new clientMessageId) is a fresh insert');
+
+    g.close();
+    h.close();
     e.close();
     f.close();
     a.close();
