@@ -9,6 +9,7 @@ import '../../core/models/models.dart';
 import '../../core/network/chat_client.dart';
 import '../../core/network/tailscale_service.dart';
 import '../../core/providers.dart';
+import '../../services/notification_service.dart';
 import '../chat/chat_page.dart';
 import '../chat/conversation_list_page.dart';
 import '../contacts/contacts_page.dart';
@@ -31,11 +32,40 @@ class _HomeShellState extends ConsumerState<HomeShell> {
   bool _connecting = false;
   String? _connectError;
   bool _connectedOnce = false;
+  StreamSubscription<ChatMessage>? _notifSub;
 
   @override
   void initState() {
     super.initState();
+    unawaited(_initNotifications());
     unawaited(_connect());
+  }
+
+  @override
+  void dispose() {
+    _notifSub?.cancel();
+    super.dispose();
+  }
+
+  /// 初始化通知系统并订阅入站消息（非当前会话 / 后台时弹通知）。
+  Future<void> _initNotifications() async {
+    final notifications = NotificationService.instance;
+    final client = ref.read(chatClientProvider); // await 前捕获，避免用后失效
+    await notifications.init();
+    if (!mounted) return;
+    _notifSub = client.incomingMessages.listen((msg) {
+      final appVisible =
+          WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+      final convActive =
+          ref.read(activeConversationProvider) == msg.conversationId;
+      if (appVisible && convActive) return; // 正在看这个会话，不打扰
+      unawaited(
+        notifications.showMessageNotification(
+          title: client.displayName(msg.senderId),
+          body: msg.text,
+        ),
+      );
+    });
   }
 
   Future<void> _connect() async {
@@ -52,14 +82,12 @@ class _HomeShellState extends ConsumerState<HomeShell> {
       // 1. Tailscale 上线（首次注册/登录需要 authKey）。
       final tailscale = ref.read(tailscaleServiceProvider);
       final state = (await tailscale.status()).state;
-      final needAuth = state == NodeState.noState ||
+      final needAuth =
+          state == NodeState.noState ||
           state == NodeState.needsLogin ||
           state == NodeState.needsMachineAuth;
       final authKey = needAuth ? SetupResult.authKey : null;
-      await tailscale.up(
-        hostname: settings.nickname,
-        authKey: authKey,
-      );
+      await tailscale.up(hostname: settings.nickname, authKey: authKey);
       // 注册/登录成功：state 已持久化到磁盘，此后不再需要 key。
       // 立即从内存清除（敏感信息）。失败时此行不会执行，key 保留供重试。
       SetupResult.authKey = null;
@@ -73,6 +101,8 @@ class _HomeShellState extends ConsumerState<HomeShell> {
         hubPort: settings.serverPort,
         hostname: settings.nickname,
       );
+      // 连接成功后启动前台保活（防止后台被系统杀掉导致断线）。
+      unawaited(NotificationService.instance.startKeepAlive());
       if (mounted) {
         setState(() {
           _connectedOnce = true;
@@ -124,11 +154,9 @@ class _HomeShellState extends ConsumerState<HomeShell> {
   }
 
   void _openChat(String peerId) {
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => ChatPage(peerId: peerId),
-      ),
-    );
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute<void>(builder: (_) => ChatPage(peerId: peerId)));
   }
 
   @override
@@ -144,9 +172,7 @@ class _HomeShellState extends ConsumerState<HomeShell> {
     });
     // 首次连接：全屏 overlay。
     if (!_connectedOnce) {
-      return Scaffold(
-        body: _connectOverlay(context),
-      );
+      return Scaffold(body: _connectOverlay(context));
     }
     return Scaffold(
       body: Column(
@@ -212,7 +238,8 @@ class _HomeShellState extends ConsumerState<HomeShell> {
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             child: Row(
               children: [
-                if (reconnecting || client.status == ConnectionStatus.connecting)
+                if (reconnecting ||
+                    client.status == ConnectionStatus.connecting)
                   SizedBox(
                     width: 14,
                     height: 14,
@@ -222,7 +249,11 @@ class _HomeShellState extends ConsumerState<HomeShell> {
                     ),
                   )
                 else
-                  Icon(Icons.cloud_off, size: 16, color: scheme.onErrorContainer),
+                  Icon(
+                    Icons.cloud_off,
+                    size: 16,
+                    color: scheme.onErrorContainer,
+                  ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
