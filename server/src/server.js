@@ -172,13 +172,15 @@ class Server {
     }
     session.nodeId = nodeId;
     session.hostname = hostname;
+    // 显示名落库：节点掉线/服务端重启后仍能找回，并下发给所有客户端。
+    this.store.upsertName(nodeId, hostname);
     this.sessions.set(nodeId, session);
     console.log(`[tl-chat] peer online: ${nodeId} (${hostname})`);
 
     this._send(session, {
       type: 'ack',
       to: nodeId,
-      payload: { ok: true, nodeId },
+      payload: { ok: true, nodeId, names: this.store.allNames() },
     });
 
     // 离线增量补发：该用户参与的每个会话，推送 seq > 游标的消息。
@@ -246,7 +248,7 @@ class Server {
           ts,
           serverId: result.serverId,
           seq: result.seq,
-          hostname: session.hostname || '',
+          hostname: session.hostname || this.store.nameOf(sender) || '',
         });
       }
     }
@@ -306,7 +308,10 @@ class Server {
     const online = [];
     for (const s of this.sessions.values()) {
       if (s.nodeId) {
-        online.push({ id: s.nodeId, name: s.hostname || s.nodeId });
+        online.push({
+          id: s.nodeId,
+          name: this.store.nameOf(s.nodeId) || s.hostname || s.nodeId,
+        });
       }
     }
     const frame = encodeFrame({ type: 'presence', payload: { online } });

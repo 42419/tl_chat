@@ -38,6 +38,11 @@ class Store {
         UNIQUE(sender, client_id)
       );
       CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conv_id, seq);
+      CREATE TABLE IF NOT EXISTS nodes (
+        node_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `);
   }
 
@@ -78,6 +83,36 @@ class Store {
       .run(convId);
   }
 
+  // ─── 节点显示名（持久化：hello 注册时写入，服务端重启不丢）──────────
+
+  /** 记录/更新节点显示名。 */
+  upsertName(nodeId, name) {
+    this.db
+      .prepare(
+        `INSERT INTO nodes (node_id, name, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(node_id) DO UPDATE SET
+           name = excluded.name,
+           updated_at = excluded.updated_at`
+      )
+      .run(nodeId, name, Date.now());
+  }
+
+  /** 全部已知节点的 {nodeId: name}（hello ack 下发，客户端启动即知所有名字）。 */
+  allNames() {
+    const rows = this.db.prepare('SELECT node_id, name FROM nodes').all();
+    const out = {};
+    for (const r of rows) out[r.node_id] = r.name;
+    return out;
+  }
+
+  /** 某节点的显示名；未知返回空串。 */
+  nameOf(nodeId) {
+    const row = this.db
+      .prepare('SELECT name FROM nodes WHERE node_id = ?')
+      .get(nodeId);
+    return row ? row.name : '';
+  }
+
   /** 某用户参与的全部会话 id。 */
   conversationsOf(nodeId) {
     const rows = this.db
@@ -96,7 +131,7 @@ class Store {
         `SELECT * FROM messages WHERE conv_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`
       )
       .all(convId, cursor, limit);
-    return rows.map(this._toWire);
+    return rows.map((r) => this._toWire(r));
   }
 
   /** 游标分页历史：seq < beforeSeq 的一页（旧→新）。 */
@@ -106,9 +141,10 @@ class Store {
         `SELECT * FROM messages WHERE conv_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?`
       )
       .all(convId, beforeSeq, limit);
-    return rows.reverse().map(this._toWire);
+    return rows.reverse().map((r) => this._toWire(r));
   }
 
+  /** 消息行 → 线上格式；携带发送者持久化显示名（离线补发/历史分页也能学到名字）。 */
   _toWire(row) {
     return {
       serverId: String(row.id),
@@ -118,6 +154,7 @@ class Store {
       text: row.text,
       ts: row.ts,
       seq: row.seq,
+      hostname: this.nameOf(row.sender),
     };
   }
 }

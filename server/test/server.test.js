@@ -8,6 +8,9 @@
 const { test, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('net');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const { Server } = require('../src/server');
 const { encodeFrame, FrameDecoder } = require('../src/protocol');
@@ -30,8 +33,8 @@ afterEach(() => {
 // ─── 测试客户端 ──────────────────────────────────────────────────────
 
 class TestClient {
-  constructor() {
-    this.socket = net.connect({ port, host: '127.0.0.1' });
+  constructor(portOverride) {
+    this.socket = net.connect({ port: portOverride ?? port, host: '127.0.0.1' });
     this.decoder = new FrameDecoder();
     this.frames = [];
     this.waiters = [];
@@ -223,6 +226,71 @@ test('read / typing 转发', async () => {
   assert.equal(typing.payload.on, true);
   a.close();
   b.close();
+});
+
+test('节点显示名持久化：重启后 ack 仍带 names，离线补发带 hostname', async () => {
+  const dbPath = path.join(
+    os.tmpdir(),
+    `tlchat-names-${process.pid}-${Date.now()}.db`,
+  );
+  let s1;
+  let s2;
+  const clients = [];
+  const track = (c) => {
+    clients.push(c);
+    return c;
+  };
+  try {
+    // 第一代服务：a 注册 alice。
+    s1 = new Server({ port: 0, host: '127.0.0.1', dbPath, dev: true });
+    s1.start();
+    await new Promise((r) => s1.netServer.once('listening', r));
+    const a = track(new TestClient(s1.netServer.address().port));
+    await a.ready;
+    a.send({ type: 'hello', from: 'node-a', payload: { hostname: 'alice' } });
+    const ackA = await a.waitFor((f) => f.type === 'ack' && f.payload?.ok);
+    assert.equal(ackA.payload.names['node-a'], 'alice');
+    a.close();
+    s1.stop();
+    s1 = null;
+
+    // 第二代服务（同一 DB）：旧节点名字仍在，新节点名字立即可见。
+    s2 = new Server({ port: 0, host: '127.0.0.1', dbPath, dev: true });
+    s2.start();
+    await new Promise((r) => s2.netServer.once('listening', r));
+    const c = track(new TestClient(s2.netServer.address().port));
+    await c.ready;
+    c.send({ type: 'hello', from: 'node-c', payload: { hostname: 'carol' } });
+    const ackC = await c.waitFor((f) => f.type === 'ack' && f.payload?.ok);
+    assert.equal(ackC.payload.names['node-a'], 'alice');
+    assert.equal(ackC.payload.names['node-c'], 'carol');
+
+    // 离线补发带 hostname：node-a 不在线时 node-c 发消息，node-a 重连后
+    // 收到补发消息，hostname 来自持久化（carol）而非在线会话。
+    c.send({
+      type: 'msg/send', from: 'node-c', to: 'node-a',
+      payload: { clientId: 'n1', text: '在吗', ts: 5000 },
+    });
+    await c.waitFor((f) => f.type === 'ack' && f.payload?.clientId === 'n1');
+    const a2 = track(new TestClient(s2.netServer.address().port));
+    await a2.ready;
+    // 空游标 = 全量补发（离线同步要求 cursors 存在才执行）。
+    a2.send({
+      type: 'hello', from: 'node-a',
+      payload: { hostname: 'alice', cursors: {} },
+    });
+    await a2.waitFor((f) => f.type === 'ack' && f.payload?.ok);
+    const push = await a2.waitFor((f) => f.type === 'msg/push');
+    assert.equal(push.payload.msg.hostname, 'carol');
+  } finally {
+    // 无论断言成败都要关服务/客户端，否则子进程事件循环不退出导致挂死。
+    for (const c of clients) c.close();
+    if (s2) s2.stop();
+    if (s1) s1.stop();
+    for (const suffix of ['', '-wal', '-shm']) {
+      fs.rmSync(dbPath + suffix, { force: true });
+    }
+  }
 });
 
 test('心跳：ping 有 pong 应答，连接保持', async () => {
