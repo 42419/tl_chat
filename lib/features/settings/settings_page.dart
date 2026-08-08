@@ -199,6 +199,9 @@ class SettingsPage extends ConsumerWidget {
     port.dispose();
     authKey.dispose();
 
+    // 先把 key 放进内存中转，再更新设置触发重连（顺序不能反，
+    // 否则 _connect() 读到的 key 可能是旧的/空的）。
+    if (key.isNotEmpty) SetupResult.authKey = key;
     if (newHost.isNotEmpty) {
       final updated = AppSettings(
         nickname: settings.nickname,
@@ -208,7 +211,6 @@ class SettingsPage extends ConsumerWidget {
       await AppSettings.save(updated);
       ref.read(appSettingsProvider.notifier).state = updated;
     }
-    if (key.isNotEmpty) SetupResult.authKey = key;
     if (!context.mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('设置已保存，正在重新连接…')),

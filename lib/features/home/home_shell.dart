@@ -49,15 +49,20 @@ class _HomeShellState extends ConsumerState<HomeShell> {
       _connectError = null;
     });
     try {
-      // 1. Tailscale 上线（首次注册需要 authKey）。
+      // 1. Tailscale 上线（首次注册/登录需要 authKey）。
       final tailscale = ref.read(tailscaleServiceProvider);
       final state = (await tailscale.status()).state;
-      final firstRegistration = state == NodeState.noState;
-      final authKey = firstRegistration ? SetupResult.authKey : null;
+      final needAuth = state == NodeState.noState ||
+          state == NodeState.needsLogin ||
+          state == NodeState.needsMachineAuth;
+      final authKey = needAuth ? SetupResult.authKey : null;
       await tailscale.up(
         hostname: settings.nickname,
         authKey: authKey,
       );
+      // 注册/登录成功：state 已持久化到磁盘，此后不再需要 key。
+      // 立即从内存清除（敏感信息）。失败时此行不会执行，key 保留供重试。
+      SetupResult.authKey = null;
 
       // 2. 解析服务地址（主机名 → tailnet IP）。
       final address = await _resolveAddress(settings.serverHost, tailscale);

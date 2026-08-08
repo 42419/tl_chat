@@ -25,11 +25,7 @@ class ChatApp extends ConsumerWidget {
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light(),
       darkTheme: AppTheme.dark(),
-      home: settings.isConfigured
-          ? const HomeShell()
-          : SetupPage(
-              onComplete: () => SetupResult.authKey = null,
-            ),
+      home: settings.isConfigured ? const HomeShell() : const SetupPage(),
     );
   }
 }
