@@ -1,0 +1,240 @@
+// 服务端集成测试（node --test）。
+//
+// 覆盖：hello 注册、消息收发与幂等去重、离线增量补发、历史分页、
+// presence 广播、read/typing 转发、心跳存活。
+
+'use strict';
+
+const { test, beforeEach, afterEach } = require('node:test');
+const assert = require('node:assert/strict');
+const net = require('net');
+
+const { Server } = require('../src/server');
+const { encodeFrame, FrameDecoder } = require('../src/protocol');
+
+let server;
+let port;
+
+// 每个用例独立服务实例 + 独立内存库，避免消息/会话跨用例泄漏。
+beforeEach(async () => {
+  server = new Server({ port: 0, host: '127.0.0.1', dbPath: ':memory:', dev: true });
+  server.start();
+  await new Promise((resolve) => server.netServer.once('listening', resolve));
+  port = server.netServer.address().port;
+});
+
+afterEach(() => {
+  server.stop();
+});
+
+// ─── 测试客户端 ──────────────────────────────────────────────────────
+
+class TestClient {
+  constructor() {
+    this.socket = net.connect({ port, host: '127.0.0.1' });
+    this.decoder = new FrameDecoder();
+    this.frames = [];
+    this.waiters = [];
+    this.socket.on('data', (chunk) => {
+      for (const frame of this.decoder.push(chunk)) {
+        this.frames.push(frame);
+        for (let i = this.waiters.length - 1; i >= 0; i--) {
+          const w = this.waiters[i];
+          if (w.pred(frame)) {
+            this.waiters.splice(i, 1);
+            w.resolve(frame);
+          }
+        }
+      }
+    });
+    this.ready = new Promise((r) => this.socket.once('connect', r));
+  }
+
+  send(frame) {
+    this.socket.write(encodeFrame(frame));
+  }
+
+  /** 等待满足 pred 的帧（最多 2s）。 */
+  waitFor(pred, timeoutMs = 2000) {
+    const hit = this.frames.find(pred);
+    if (hit) return Promise.resolve(hit);
+    return new Promise((resolve, reject) => {
+      const w = { pred, resolve };
+      this.waiters.push(w);
+      setTimeout(() => {
+        const i = this.waiters.indexOf(w);
+        if (i >= 0) this.waiters.splice(i, 1);
+        reject(new Error('timeout waiting for frame'));
+      }, timeoutMs);
+    });
+  }
+
+  close() {
+    this.socket.destroy();
+  }
+}
+
+/** 等待两个客户端各自完成 hello。 */
+async function helloPair() {
+  const a = new TestClient();
+  const b = new TestClient();
+  await Promise.all([a.ready, b.ready]);
+  a.send({ type: 'hello', from: 'node-a', payload: { hostname: 'alice' } });
+  b.send({ type: 'hello', from: 'node-b', payload: { hostname: 'bob' } });
+  const [ackA, ackB] = await Promise.all([
+    a.waitFor((f) => f.type === 'ack' && f.payload?.ok),
+    b.waitFor((f) => f.type === 'ack' && f.payload?.ok),
+  ]);
+  assert.equal(ackA.payload.nodeId, 'node-a');
+  assert.equal(ackB.payload.nodeId, 'node-b');
+  return { a, b };
+}
+
+test('hello 注册 + presence 广播', async () => {
+  const { a, b } = await helloPair();
+  const presence = await a.waitFor(
+    (f) => f.type === 'presence' && f.payload?.online?.length >= 2,
+  );
+  const ids = presence.payload.online.map((x) => x.id);
+  assert.deepEqual(new Set(ids), new Set(['node-a', 'node-b']));
+  a.close();
+  b.close();
+});
+
+test('消息收发：ack 回执 + 实时 push + 幂等去重', async () => {
+  const { a, b } = await helloPair();
+  a.send({
+    type: 'msg/send',
+    from: 'node-a',
+    to: 'node-b',
+    payload: { clientId: 'c1', text: '你好', ts: 1000 },
+  });
+  const ack = await a.waitFor((f) => f.type === 'ack' && f.payload?.clientId === 'c1');
+  assert.equal(ack.payload.ok, true);
+  assert.equal(ack.payload.seq, 1);
+  assert.equal(ack.payload.conv, 'node-a:node-b');
+
+  const push = await b.waitFor((f) => f.type === 'msg/push');
+  assert.equal(push.payload.msg.sender, 'node-a');
+  assert.equal(push.payload.msg.text, '你好');
+  assert.equal(push.payload.msg.seq, 1);
+  assert.equal(push.payload.msg.conv, 'node-a:node-b');
+
+  // 相同 clientId 重发 → ack 返回同一 serverId/seq，且不二次推送。
+  const pushesBefore = b.frames.filter((f) => f.type === 'msg/push').length;
+  a.send({
+    type: 'msg/send',
+    from: 'node-a',
+    to: 'node-b',
+    payload: { clientId: 'c1', text: '你好', ts: 1000 },
+  });
+  const dupAck = await a.waitFor(
+    (f) => f.type === 'ack' && f.payload?.clientId === 'c1' && f.payload?.serverId === ack.payload.serverId,
+  );
+  assert.equal(dupAck.payload.ok, true);
+  assert.equal(dupAck.payload.seq, ack.payload.seq);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(b.frames.filter((f) => f.type === 'msg/push').length, pushesBefore);
+  a.close();
+  b.close();
+});
+
+test('离线增量补发：游标之前的消息不下发，之后的下发', async () => {
+  // b 先上线收一条，再离线。
+  const { a, b } = await helloPair();
+  a.send({
+    type: 'msg/send', from: 'node-a', to: 'node-b',
+    payload: { clientId: 'o1', text: '离线前', ts: 2000 },
+  });
+  await b.waitFor((f) => f.type === 'msg/push' && f.payload.msg.text === '离线前');
+  b.close();
+  await new Promise((r) => setTimeout(r, 50));
+
+  // a 在 b 离线时发一条。
+  a.send({
+    type: 'msg/send', from: 'node-a', to: 'node-b',
+    payload: { clientId: 'o2', text: '离线中', ts: 3000 },
+  });
+  await a.waitFor((f) => f.type === 'ack' && f.payload?.clientId === 'o2');
+
+  // b 重连：游标已到 seq 1 → 只应补发 seq 2。
+  const b2 = new TestClient();
+  await b2.ready;
+  b2.send({
+    type: 'hello', from: 'node-b',
+    payload: { hostname: 'bob', cursors: { 'node-a:node-b': 1 } },
+  });
+  await b2.waitFor((f) => f.type === 'ack' && f.payload?.ok);
+  const pushed = await b2.waitFor((f) => f.type === 'msg/push');
+  assert.equal(pushed.payload.msg.text, '离线中');
+  assert.equal(pushed.payload.msg.seq, 2);
+  await new Promise((r) => setTimeout(r, 100));
+  // 不应再有第二条 push（离线前的消息游标已覆盖）。
+  assert.equal(b2.frames.filter((f) => f.type === 'msg/push').length, 1);
+  a.close();
+  b2.close();
+});
+
+test('历史分页：beforeSeq 游标 + hasMore', async () => {
+  const { a, b } = await helloPair();
+  for (let i = 1; i <= 5; i++) {
+    a.send({
+      type: 'msg/send', from: 'node-a', to: 'node-b',
+      payload: { clientId: `h${i}`, text: `msg${i}`, ts: 4000 + i },
+    });
+    await a.waitFor((f) => f.type === 'ack' && f.payload?.clientId === `h${i}`);
+  }
+  a.send({
+    type: 'msg/history', from: 'node-a', to: 'node-b',
+    payload: { beforeSeq: 6, limit: 3 },
+  });
+  const result = await a.waitFor((f) => f.type === 'msg/history_result');
+  assert.equal(result.payload.messages.length, 3);
+  assert.equal(result.payload.hasMore, true);
+  assert.deepEqual(result.payload.messages.map((m) => m.text), ['msg3', 'msg4', 'msg5']);
+  // 第一页再往前 → hasMore=false。
+  a.send({
+    type: 'msg/history', from: 'node-a', to: 'node-b',
+    payload: { beforeSeq: 3, limit: 3 },
+  });
+  const page1 = await a.waitFor(
+    (f) => f.type === 'msg/history_result' && f.payload.messages[0]?.text === 'msg1',
+  );
+  assert.equal(page1.payload.messages.length, 2);
+  assert.equal(page1.payload.hasMore, false);
+  a.close();
+  b.close();
+});
+
+test('read / typing 转发', async () => {
+  const { a, b } = await helloPair();
+  b.send({
+    type: 'read', from: 'node-b', to: 'node-a', payload: { upToTs: 9999 },
+  });
+  const read = await a.waitFor((f) => f.type === 'read');
+  assert.equal(read.from, 'node-b');
+  assert.equal(read.payload.upToTs, 9999);
+
+  b.send({
+    type: 'typing', from: 'node-b', to: 'node-a', payload: { on: true },
+  });
+  const typing = await a.waitFor((f) => f.type === 'typing');
+  assert.equal(typing.from, 'node-b');
+  assert.equal(typing.payload.on, true);
+  a.close();
+  b.close();
+});
+
+test('心跳：ping 有 pong 应答，连接保持', async () => {
+  const c = new TestClient();
+  await c.ready;
+  c.send({ type: 'hello', from: 'node-ping', payload: { hostname: 'ping' } });
+  await c.waitFor((f) => f.type === 'ack' && f.payload?.ok);
+  c.send({ type: 'ping' });
+  const pong = await c.waitFor((f) => f.type === 'pong');
+  assert.ok(pong);
+  // 服务端也会主动 ping，客户端应答后 socket 应存活。
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(c.socket.destroyed, false);
+  c.close();
+});

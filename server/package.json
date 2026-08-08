@@ -1,0 +1,14 @@
+{
+  "name": "tl-chat-server",
+  "version": "1.0.0",
+  "description": "TL Chat lightweight relay server — runs on the tailnet, relays 1:1 messages with SQLite storage",
+  "private": true,
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=23.4"
+  }
+}
