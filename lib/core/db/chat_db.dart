@@ -11,7 +11,7 @@ class ChatDb {
   ChatDb._(this._db);
 
   static const _dbName = 'chat.db';
-  static const _dbVersion = 1;
+  static const _dbVersion = 2;
 
   final Database _db;
 
@@ -21,8 +21,22 @@ class ChatDb {
       p.join(dir, _dbName),
       version: _dbVersion,
       onCreate: _createSchema,
+      onUpgrade: _upgradeSchema,
     );
     return ChatDb._(db);
+  }
+
+  /// v1 → v2：新增 names 表（nodeId → 显示名，重启后恢复昵称）。
+  static Future<void> _upgradeSchema(
+    Database db,
+    int oldVersion,
+    int newVersion,
+  ) async {
+    if (oldVersion < 2) {
+      await db.execute(
+        'CREATE TABLE names (node_id TEXT PRIMARY KEY, name TEXT NOT NULL)',
+      );
+    }
   }
 
   static Future<void> _createSchema(Database db, int version) async {
@@ -52,6 +66,9 @@ class ChatDb {
     ''');
     await db.execute(
       'CREATE INDEX idx_messages_conv ON messages(conv_id, seq)',
+    );
+    await db.execute(
+      'CREATE TABLE names (node_id TEXT PRIMARY KEY, name TEXT NOT NULL)',
     );
   }
 
@@ -101,6 +118,23 @@ class ChatDb {
   Future<void> clearAll() async {
     await _db.delete('messages');
     await _db.delete('conversations');
+  }
+
+  // ─── 节点显示名（持久化，重启后恢复）────────────────────────────────
+
+  Future<void> upsertName(String nodeId, String name) async {
+    await _db.insert(
+      'names',
+      {'node_id': nodeId, 'name': name},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<Map<String, String>> loadNames() async {
+    final rows = await _db.query('names');
+    return {
+      for (final r in rows) r['node_id'] as String: r['name'] as String,
+    };
   }
 
   // ─── 消息 ──────────────────────────────────────────────────────────

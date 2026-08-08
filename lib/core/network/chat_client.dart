@@ -57,8 +57,33 @@ class ChatClient extends ChangeNotifier {
   String? _myNodeId;
   String? _myHostname;
 
-  /// nodeId → 显示名（presence / 消息发送者学习）。
+  /// nodeId → 显示名（presence / 消息发送者学习；本地持久化，重启恢复）。
   final Map<String, String> _names = {};
+
+  /// 学习并持久化一个节点的显示名，随后刷新受影响会话标题。
+  void _learnName(String nodeId, String name) {
+    if (name.isEmpty || name == nodeId) return;
+    if (_names[nodeId] == name) return;
+    _names[nodeId] = name;
+    unawaited(_db?.upsertName(nodeId, name));
+    _applyNamesToTitles();
+  }
+
+  /// 用已学习的名字刷新 1:1 会话标题。
+  /// 注意：会话按 convId（"a:b"）索引，不能拿 nodeId 直接查会话表。
+  void _applyNamesToTitles() {
+    if (_myNodeId == null) return;
+    var changed = false;
+    for (final conv in _conversations.values) {
+      if (conv.isGroup) continue;
+      final name = _names[_peerOf(conv.id)];
+      if (name != null && name.isNotEmpty && conv.title != name) {
+        conv.title = name;
+        changed = true;
+      }
+    }
+    if (changed) notifyListeners();
+  }
 
   /// 在线节点 id 集合。
   final Set<String> _onlineNodes = {};
@@ -156,6 +181,12 @@ class ChatClient extends ChangeNotifier {
   Future<void> init() async {
     try {
       _db = await ChatDb.open();
+      // 恢复本地持久化的节点显示名（重启后无需等新消息就能显示正确昵称）。
+      try {
+        _names.addAll(await _db!.loadNames());
+      } catch (_) {
+        // 老库迁移失败时忽略，名字会在下次连接时重新学到。
+      }
       final convs = await _db!.listConversations();
       for (final conv in convs) {
         final messages = await _db!.listMessages(conv.id, limit: 200);
@@ -208,6 +239,8 @@ class ChatClient extends ChangeNotifier {
       if (_myNodeId == null || _myNodeId!.isEmpty) {
         throw const ChatException('无法获取本机节点 ID（请先上线）');
       }
+      // 拿到本机节点 ID 后，用本地已恢复的名字刷新 1:1 会话标题。
+      _applyNamesToTitles();
 
       // hello 注册：携带每会话同步游标，服务端据此增量下发离线消息。
       final waiter = Completer<void>();
@@ -303,11 +336,17 @@ class ChatClient extends ChangeNotifier {
   void _onAck(ChatFrame frame) {
     final ok = frame.payload?['ok'] == true;
 
-    // hello ack：完成 connect() 等待。
+    // hello ack：完成 connect() 等待；服务端同时下发全量已知节点显示名。
     final hello = _helloAck;
     if (hello != null) {
       _helloAck = null;
       if (ok) {
+        final names = frame.payload?['names'];
+        if (names is Map) {
+          names.forEach((k, v) {
+            if (k is String && v is String) _learnName(k, v);
+          });
+        }
         hello.complete();
       } else {
         final error = frame.payload?['error'] ?? 'unknown';
@@ -494,8 +533,9 @@ class ChatClient extends ChangeNotifier {
     final seq = (map['seq'] as num?)?.toInt();
     final isMine = sender == _myNodeId;
 
-    if (map['hostname'] != null && map['hostname']!.isNotEmpty) {
-      _names[sender] = map['hostname'] as String;
+    final hostname = map['hostname'] as String?;
+    if (hostname != null && hostname.isNotEmpty) {
+      _learnName(sender, hostname);
     }
 
     final conv = _conversations.putIfAbsent(
@@ -611,6 +651,10 @@ class ChatClient extends ChangeNotifier {
           seq: (map['seq'] as num?)?.toInt(),
           status: MessageStatus.sent,
         );
+        final hostname = map['hostname'] as String?;
+        if (hostname != null && hostname.isNotEmpty) {
+          _learnName(msg.senderId, hostname);
+        }
         // 去重。
         if (conv.messages.any(
           (m) =>
@@ -727,14 +771,11 @@ class ChatClient extends ChangeNotifier {
         final name = item['name'] as String?;
         if (id == null || id == _myNodeId) continue;
         _onlineNodes.add(id);
-        if (name != null && name.isNotEmpty) _names[id] = name;
+        if (name != null && name.isNotEmpty) _learnName(id, name);
       }
     }
-    // 刷新 1:1 会话标题。
-    for (final entry in _names.entries) {
-      final conv = _conversations[entry.key];
-      if (conv != null && !conv.isGroup) conv.title = entry.value;
-    }
+    // 刷新 1:1 会话标题（按 peer 反查，覆盖离线也学到的名字）。
+    _applyNamesToTitles();
     notifyListeners();
   }
 
