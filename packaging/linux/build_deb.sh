@@ -16,6 +16,12 @@ OUT="${2:?output .deb path required}"
 VERSION="${3:?version required}"
 ARCH="${4:?arch required}"
 
+# dpkg-deb 强制版本号以数字开头；不符合则加前缀兜底。
+if ! [[ "$VERSION" =~ ^[0-9] ]]; then
+  echo "warning: 版本号 '$VERSION' 不以数字开头，已改为 0.0.0-$VERSION"
+  VERSION="0.0.0-$VERSION"
+fi
+
 [ -d "$BUNDLE" ] || { echo "error: bundle 目录不存在: $BUNDLE"; exit 1; }
 
 # bundle 根目录下的可执行文件（如 tl_chat）

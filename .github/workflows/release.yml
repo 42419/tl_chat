@@ -156,7 +156,8 @@ jobs:
           if [ "${{ github.ref_type }}" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION="dev"
+            # 手动触发：Debian 版本号必须以数字开头（dpkg-deb 强校验）
+            VERSION="0.0.0-dev.$(date +%Y%m%d%H%M)"
           fi
           bash packaging/linux/build_deb.sh \
             "build/linux/x64/release/bundle" \
