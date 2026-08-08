@@ -1,0 +1,123 @@
+# Release 打包：按 ABI 拆分构建 release APK 并上传。
+#
+# 触发方式：
+#   - 手动触发（Actions 页 Run workflow）
+#   - 推送 v* 标签（如 v1.0.0）→ 构建完成后自动创建 GitHub Release 并附加 APK
+#
+# 要点：
+#   - tailscale 是 path 依赖（pubspec.yaml: ../tailscale_dart），必须 clone 到
+#     与本仓库同级的目录；来源：https://github.com/42419/tailscale_dart
+#   - tailscale_dart 的 native hook 需要 Go 1.26+ 与 Android NDK
+#     （hook 自动执行，无需手动调起）
+#   - release 构建使用 debug 签名（当前 build.gradle.kts 配置），可直接安装；
+#     若要上架商店需换成正式签名（后续可加 secrets）
+#   - Gradle / pub / Go 依赖均已缓存，加速重复构建
+
+name: Release APK
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+# softprops/action-gh-release 需要写权限（仅在打标签时使用）
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: Build APK (split per ABI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout tl_chat
+        uses: actions/checkout@v4
+
+      - name: Clone tailscale_dart（path 依赖须与本仓库同级）
+        run: |
+          git clone --depth 1 https://github.com/42419/tailscale_dart \
+            "$GITHUB_WORKSPACE/../tailscale_dart"
+          ls "$GITHUB_WORKSPACE/../tailscale_dart/go/go.mod"
+
+      - name: Setup Java (JDK 17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.8'
+          cache: true
+
+      - name: Setup Go (tailscale_dart 原生库构建)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: ../tailscale_dart/go/go.sum
+
+      - name: Locate Android NDK（供 tailscale build hook 使用）
+        run: |
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | head -1)
+          if [ -z "$NDK" ]; then
+            echo "::error::未找到 Android NDK（sdkmanager --install \"ndk;27.0.12077973\"）"
+            exit 1
+          fi
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "using NDK: $NDK"
+
+      - name: Toolchain info
+        run: |
+          flutter --version
+          go version
+          java -version
+          echo "NDK: $ANDROID_NDK_HOME"
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Build release APKs（按 ABI 拆分）
+        run: flutter build apk --release --split-per-abi
+
+      - name: Rename APKs（tl-chat-<版本>-android-<abi>.apk）
+        run: |
+          # 只有打标签时用版本号；手动触发用 dev
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="dev"
+          fi
+          cd build/app/outputs/flutter-apk
+          for f in app-*-release.apk; do
+            abi="${f#app-}"
+            abi="${abi%-release.apk}"
+            mv "$f" "tl-chat-${VERSION}-android-${abi}.apk"
+          done
+          ls -lh
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tl-chat-release-apks
+          path: build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+
+      - name: Create GitHub Release（仅打标签时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/app/outputs/flutter-apk/*.apk
+          generate_release_notes: true
