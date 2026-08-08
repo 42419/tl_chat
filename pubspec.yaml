@@ -35,6 +35,19 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
 
+  # Tailscale embedded networking（路径依赖，须与 tl_chat 同级）
+  tailscale:
+    path: ../tailscale_dart
+
+  # 基础
+  path_provider: ^2.1.6
+  path: ^1.9.1
+  shared_preferences: ^2.3.2
+
+  # 状态管理与本地存储
+  flutter_riverpod: ^2.6.1
+  sqflite: ^2.4.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

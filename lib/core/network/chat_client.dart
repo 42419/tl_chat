@@ -1,0 +1,900 @@
+/// ChatClient — 客户端网络与应用状态核心（Riverpod ChangeNotifier）。
+///
+/// 职责：
+///   - 通过 Tailscale TCP 连接中心服务，心跳保活 + 指数退避重连
+///   - hello 注册、消息发送（乐观 UI + 幂等 clientId）、接收、历史分页
+///   - 已读回执、打字指示、presence（在线名单）
+///   - 与本地 sqflite 双向同步（缓存 + 离线队列）
+///
+/// 协议：见 lib/core/network/frame_codec.dart 与 server/src/protocol.js。
+library;
+
+import 'dart:async';
+import 'dart:math';
+
+import 'package:flutter/foundation.dart';
+import 'package:tailscale/tailscale.dart';
+
+import '../db/chat_db.dart';
+import '../models/models.dart';
+import 'frame_codec.dart';
+import 'tailscale_service.dart';
+
+/// 历史分页结果。
+class HistoryPage {
+  const HistoryPage({required this.messages, required this.hasMore});
+
+  final List<ChatMessage> messages;
+  final bool hasMore;
+}
+
+/// 抛给 UI 的连接/协议错误。
+class ChatException implements Exception {
+  const ChatException(this.message);
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+class ChatClient extends ChangeNotifier {
+  ChatClient({required this.tailscale});
+
+  final TailscaleService tailscale;
+
+  ChatDb? _db;
+
+  // ─── 连接状态 ──────────────────────────────────────────────────────
+  TailscaleConnection? _conn;
+  StreamSubscription<Uint8List>? _inputSub;
+  final FrameDecoder _decoder = FrameDecoder();
+  Timer? _heartbeat;
+  Timer? _pongTimeout;
+
+  ConnectionStatus _status = ConnectionStatus.disconnected;
+  String _statusText = '未连接';
+  String? _lastError;
+  String? _myNodeId;
+  String? _myHostname;
+
+  /// nodeId → 显示名（presence / 消息发送者学习）。
+  final Map<String, String> _names = {};
+
+  /// 在线节点 id 集合。
+  final Set<String> _onlineNodes = {};
+
+  final Map<String, Conversation> _conversations = {};
+
+  /// 当前打开的会话（UI 设置，用于未读计数与自动已读）。
+  String? activeConversationId;
+
+  // ─── 自动重连 ──────────────────────────────────────────────────────
+  String? _hubHost;
+  int? _hubPort;
+  Timer? _reconnectTimer;
+  int _reconnectAttempt = 0;
+  bool _autoReconnect = false;
+  static const _maxReconnectSeconds = 30;
+
+  // ─── 发送状态机 ────────────────────────────────────────────────────
+  final Map<String, _PendingSend> _pending = {};
+  static const _ackTimeout = Duration(seconds: 15);
+
+  Completer<void>? _helloAck;
+
+  // ─── 历史分页 ──────────────────────────────────────────────────────
+  Completer<HistoryPage>? _historyCompleter;
+  String? _historyConvId;
+  final Set<String> _noMoreHistory = {};
+
+  // ─── 打字指示（入站）───────────────────────────────────────────────
+  final Map<String, Set<String>> _typingSenders = {};
+  final Map<String, Map<String, Timer>> _typingTtls = {};
+  static const _typingTtl = Duration(seconds: 5);
+
+  // ─── 对外暴露 ──────────────────────────────────────────────────────
+  ConnectionStatus get status => _status;
+  String get statusText => _statusText;
+  String? get lastError => _lastError;
+  String? get myNodeId => _myNodeId;
+  String? get myHostname => _myHostname;
+  List<String> get onlineNodes => List.unmodifiable(_onlineNodes);
+  Iterable<Conversation> get conversations => _conversations.values;
+
+  String displayName(String nodeId) => _names[nodeId] ?? nodeId;
+
+  Conversation? conversationById(String id) => _conversations[id];
+
+  /// 当前用户视角下消息是否为“我发的”。
+  bool isMine(ChatMessage msg) => msg.senderId == _myNodeId;
+
+  /// 从本机删除一条消息（仅本地，不影响服务端记录）。
+  void deleteMessageLocally(String convId, String clientId) {
+    final conv = _conversations[convId];
+    if (conv == null) return;
+    conv.messages.removeWhere((m) => m.clientId == clientId);
+    conv.lastMessage = conv.messages.isEmpty ? null : conv.messages.last;
+    unawaited(_db?.deleteMessage(clientId));
+    _persistConversation(conv);
+    notifyListeners();
+  }
+
+  /// 清空本地缓存（会话 + 消息），下次连接从服务端重新同步。
+  Future<void> clearLocalCache() async {
+    _conversations.clear();
+    _noMoreHistory.clear();
+    notifyListeners();
+    await _db?.clearAll();
+  }
+
+  /// 将 [convId] 标记为已读并清零未读计数。
+  void markRead(String convId) {
+    final conv = _conversations[convId];
+    if (conv == null || conv.unread == 0) return;
+    conv.unread = 0;
+    unawaited(_db?.clearUnread(convId));
+    notifyListeners();
+  }
+
+  /// 与 [peerId] 的 1:1 会话 id（双方各自计算一致）。
+  String convIdForPeer(String peerId) => _convIdFor(_myNodeId ?? '', peerId);
+
+  /// 获取（不存在则创建）与 [peerId] 的会话。
+  Conversation conversationWith(String peerId) {
+    final nodeId = _myNodeId;
+    if (nodeId == null) {
+      throw const ChatException('未连接');
+    }
+    final convId = _convIdFor(nodeId, peerId);
+    return _conversations.putIfAbsent(
+      convId,
+      () => Conversation(id: convId, title: displayName(peerId)),
+    );
+  }
+
+  // ─── 初始化：打开本地库并加载缓存 ─────────────────────────────────
+  Future<void> init() async {
+    try {
+      _db = await ChatDb.open();
+      final convs = await _db!.listConversations();
+      for (final conv in convs) {
+        final messages = await _db!.listMessages(conv.id, limit: 200);
+        conv.messages.addAll(messages);
+        if (messages.isNotEmpty) conv.lastMessage = messages.last;
+        for (final m in messages) {
+          final s = m.seq;
+          if (s != null && s > conv.lastSeq) conv.lastSeq = s;
+        }
+        _conversations[conv.id] = conv;
+      }
+      notifyListeners();
+    } catch (_) {
+      // 平台目录不可用（如测试）：降级为纯内存运行。
+    }
+  }
+
+  // ─── 连接管理 ──────────────────────────────────────────────────────
+
+  /// 连接中心服务。要求 Tailscale 已 [up]。连接成功后自动进入自动重连模式。
+  Future<void> connect({
+    required String hubHost,
+    required int hubPort,
+    required String hostname,
+  }) async {
+    if (_status == ConnectionStatus.connected) return;
+    _hubHost = hubHost;
+    _hubPort = hubPort;
+    _myHostname = hostname;
+    _reconnectTimer?.cancel();
+    _setStatus(ConnectionStatus.connecting, '连接中…');
+
+    try {
+      final conn = await tailscale.dial(
+        hubHost,
+        hubPort,
+        timeout: const Duration(seconds: 15),
+      );
+      _conn = conn;
+      _inputSub = conn.input.listen(
+        _onData,
+        onError: (Object e) => _fail('连接异常: $e'),
+        onDone: _onDisconnected,
+        cancelOnError: true,
+      );
+
+      // 本地稳定节点 ID（hello 注册身份）。
+      final status = await tailscale.status();
+      _myNodeId = status.stableNodeId;
+      if (_myNodeId == null || _myNodeId!.isEmpty) {
+        throw const ChatException('无法获取本机节点 ID（请先上线）');
+      }
+
+      // hello 注册：携带每会话同步游标，服务端据此增量下发离线消息。
+      final waiter = Completer<void>();
+      _helloAck = waiter;
+      final cursors = <String, int>{
+        for (final c in _conversations.values)
+          if (c.lastSeq > 0) c.id: c.lastSeq,
+      };
+      _sendFrame(ChatFrame(
+        type: 'hello',
+        from: _myNodeId,
+        payload: {'hostname': hostname, 'cursors': cursors},
+      ));
+      await waiter.future.timeout(
+        const Duration(seconds: 20),
+        onTimeout: () {
+          _helloAck = null;
+          throw const ChatException('注册超时：服务端无响应');
+        },
+      );
+
+      _status = ConnectionStatus.connected;
+      _statusText = '已连接';
+      _autoReconnect = true;
+      _reconnectAttempt = 0;
+      _flushPending();
+      _startHeartbeat();
+      notifyListeners();
+    } catch (e) {
+      if (e is ChatException) {
+        _fail(e.message);
+      } else {
+        _fail('连接失败: $e');
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> disconnect() async {
+    _autoReconnect = false;
+    _reconnectTimer?.cancel();
+    _sendFrame(const ChatFrame(type: 'bye'));
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    _teardown();
+    _setStatus(ConnectionStatus.disconnected, '未连接');
+  }
+
+  void _onData(Uint8List chunk) {
+    try {
+      for (final frame in _decoder.push(chunk)) {
+        _onFrame(frame);
+      }
+    } on FormatException catch (e) {
+      _fail('协议错误: ${e.message}');
+    }
+  }
+
+  void _onFrame(ChatFrame frame) {
+    switch (frame.type) {
+      case 'ack':
+        _onAck(frame);
+        break;
+      case 'ping':
+        _sendFrame(const ChatFrame(type: 'pong'));
+        break;
+      case 'pong':
+        _pongTimeout?.cancel();
+        _pongTimeout = null;
+        break;
+      case 'msg/push':
+        _onPush(frame);
+        break;
+      case 'msg/history_result':
+        _onHistoryResult(frame);
+        break;
+      case 'read':
+        _onReadReceipt(frame);
+        break;
+      case 'typing':
+        _onTyping(frame);
+        break;
+      case 'presence':
+        _onPresence(frame);
+        break;
+      case 'bye':
+        _onDisconnected();
+        break;
+      default:
+        break;
+    }
+  }
+
+  void _onAck(ChatFrame frame) {
+    final ok = frame.payload?['ok'] == true;
+
+    // hello ack：完成 connect() 等待。
+    final hello = _helloAck;
+    if (hello != null) {
+      _helloAck = null;
+      if (ok) {
+        hello.complete();
+      } else {
+        final error = frame.payload?['error'] ?? 'unknown';
+        hello.completeError(ChatException('注册被拒绝: $error'));
+        _autoReconnect = false; // 认证失败不自动重连
+      }
+      return;
+    }
+
+    // msg ack：匹配 clientId 回填 serverId/seq 并置为 sent。
+    final clientId = frame.payload?['clientId'] as String?;
+    if (clientId == null) return;
+    final pending = _pending.remove(clientId);
+    pending?.timer?.cancel();
+    if (!ok) {
+      // 服务端拒绝（如校验失败）：标记 failed，用户可长按重发。
+      for (final conv in _conversations.values) {
+        for (var i = 0; i < conv.messages.length; i++) {
+          if (conv.messages[i].clientId != clientId) continue;
+          conv.messages[i] = conv.messages[i].copyWith(
+            status: MessageStatus.failed,
+          );
+          break;
+        }
+      }
+      unawaited(_db?.updateMessage(clientId, status: MessageStatus.failed));
+      notifyListeners();
+      return;
+    }
+    final serverId = frame.payload?['serverId'] as String?;
+    final seq = (frame.payload?['seq'] as num?)?.toInt();
+    final convId = frame.payload?['conv'] as String?;
+
+    final conv = convId != null ? _conversations[convId] : null;
+    if (conv != null) {
+      for (var i = 0; i < conv.messages.length; i++) {
+        final m = conv.messages[i];
+        if (m.clientId != clientId) continue;
+        var updated = m.copyWith(status: MessageStatus.sent);
+        if (serverId != null) updated = updated.copyWith(serverId: serverId);
+        if (seq != null) updated = updated.copyWith(seq: seq);
+        conv.messages[i] = updated;
+        if (seq != null && seq > conv.lastSeq) conv.lastSeq = seq;
+        break;
+      }
+      _persistConversation(conv);
+      if (serverId != null || seq != null) {
+        unawaited(_db?.updateMessage(clientId, serverId: serverId, seq: seq, status: MessageStatus.sent));
+      }
+      notifyListeners();
+    }
+  }
+
+  // ─── 发送 ──────────────────────────────────────────────────────────
+
+  /// 乐观发送一条文本消息。离线时消息先落本地，重连后自动冲刷。
+  ChatMessage sendText(String to, String text) {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) {
+      throw const ChatException('空消息');
+    }
+    final nodeId = _myNodeId;
+    if (nodeId == null) {
+      throw const ChatException('未连接');
+    }
+    final clientId = _newClientId();
+    final convId = _convIdFor(nodeId, to);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final msg = ChatMessage(
+      clientId: clientId,
+      conversationId: convId,
+      senderId: nodeId,
+      text: trimmed,
+      createdAt: now,
+      status: MessageStatus.sending,
+    );
+
+    final conv = _conversations.putIfAbsent(
+      convId,
+      () => Conversation(id: convId, title: displayName(to)),
+    );
+    conv.messages.add(msg);
+    conv.lastMessage = msg;
+    _persistMessage(msg);
+    _persistConversation(conv);
+    notifyListeners();
+
+    _trackPending(
+      convId: convId,
+      to: to,
+      clientId: clientId,
+      wireSent: _status == ConnectionStatus.connected,
+    );
+    if (_status == ConnectionStatus.connected) {
+      _sendMsg(to: to, clientId: clientId, text: trimmed, ts: now);
+    }
+    return msg;
+  }
+
+  void _sendMsg({
+    required String to,
+    required String clientId,
+    required String text,
+    required int ts,
+  }) {
+    _sendFrame(ChatFrame(
+      type: 'msg/send',
+      from: _myNodeId,
+      to: to,
+      payload: {'clientId': clientId, 'text': text, 'ts': ts},
+    ));
+  }
+
+  /// 注册 pending。仅 [wireSent]（已真正写入连接）时武装 15s ack 超时；
+  /// 离线入队的消息不带定时器，等重连 [_flushPending] 补发成功后再武装。
+  void _trackPending({
+    required String convId,
+    required String to,
+    required String clientId,
+    bool wireSent = false,
+  }) {
+    _pending[clientId]?.timer?.cancel();
+    _pending[clientId] = _PendingSend(
+      convId: convId,
+      to: to,
+      clientId: clientId,
+      wireSent: wireSent,
+      timer: wireSent
+          ? Timer(_ackTimeout, () {
+              _pending.remove(clientId);
+              final conv = _conversations[convId];
+              if (conv == null) return;
+              for (var i = 0; i < conv.messages.length; i++) {
+                final m = conv.messages[i];
+                if (m.clientId == clientId) {
+                  conv.messages[i] = m.copyWith(status: MessageStatus.failed);
+                  break;
+                }
+              }
+              unawaited(
+                _db?.updateMessage(clientId, status: MessageStatus.failed),
+              );
+              notifyListeners();
+            })
+          : null,
+    );
+  }
+
+  /// 重发一条失败消息（复用原 clientId，服务端幂等去重）。
+  void resend(String clientId) {
+    for (final conv in _conversations.values) {
+      for (var i = 0; i < conv.messages.length; i++) {
+        final m = conv.messages[i];
+        if (m.clientId != clientId) continue;
+        final updated = m.copyWith(status: MessageStatus.sending);
+        conv.messages[i] = updated;
+        _trackPending(
+          convId: conv.id,
+          to: _peerOf(conv.id),
+          clientId: clientId,
+          wireSent: _status == ConnectionStatus.connected,
+        );
+        if (_status == ConnectionStatus.connected) {
+          _sendMsg(to: _peerOf(conv.id), clientId: clientId, text: m.text, ts: m.createdAt);
+        }
+        notifyListeners();
+        return;
+      }
+    }
+  }
+
+  // ─── 接收 ──────────────────────────────────────────────────────────
+
+  void _onPush(ChatFrame frame) {
+    final raw = frame.payload?['msg'];
+    if (raw is! Map) return;
+    final map = Map<String, dynamic>.from(raw);
+    final convId = map['conv'] as String;
+    final sender = map['sender'] as String;
+    final text = map['text'] as String? ?? '';
+    final ts = (map['ts'] as num?)?.toInt() ?? 0;
+    final clientId = map['clientId'] as String? ?? 's$ts-$convId';
+    final serverId = map['serverId'] as String?;
+    final seq = (map['seq'] as num?)?.toInt();
+    final isMine = sender == _myNodeId;
+
+    if (map['hostname'] != null && map['hostname']!.isNotEmpty) {
+      _names[sender] = map['hostname'] as String;
+    }
+
+    final conv = _conversations.putIfAbsent(
+      convId,
+      () => Conversation(
+        id: convId,
+        title: isMine ? displayName(_peerOf(convId)) : displayName(sender),
+      ),
+    );
+    if (!conv.isGroup) {
+      conv.title = isMine ? displayName(_peerOf(convId)) : displayName(sender);
+    }
+
+    // 去重：同一 serverId 或 clientId 已存在则忽略。
+    if (conv.messages.any(
+      (m) =>
+          (serverId != null && m.serverId == serverId) ||
+          m.clientId == clientId,
+    )) {
+      return;
+    }
+
+    final msg = ChatMessage(
+      clientId: clientId,
+      conversationId: convId,
+      senderId: sender,
+      text: text,
+      createdAt: ts,
+      serverId: serverId,
+      seq: seq,
+      status: isMine ? MessageStatus.sent : MessageStatus.delivered,
+    );
+    conv.messages.add(msg);
+    conv.lastMessage = msg;
+    if (seq != null && seq > conv.lastSeq) conv.lastSeq = seq;
+
+    if (isMine) {
+      // 服务端回推自己的消息（其他设备场景）——不计未读。
+    } else if (convId == activeConversationId) {
+      conv.unread = 0;
+      unawaited(_db?.clearUnread(convId));
+      sendReadReceipt(convId);
+    } else {
+      conv.unread++;
+      unawaited(_db?.incrementUnread(convId));
+    }
+
+    _persistMessage(msg);
+    _persistConversation(conv);
+    notifyListeners();
+  }
+
+  /// 拉取一页更早的历史。返回前消息已按序 PREPEND 到会话列表。
+  Future<HistoryPage> fetchHistory(
+    String convId, {
+    required int beforeSeq,
+    int limit = 30,
+  }) {
+    if (_status != ConnectionStatus.connected || _myNodeId == null) {
+      return Future.value(const HistoryPage(messages: [], hasMore: false));
+    }
+    if (_noMoreHistory.contains(convId)) {
+      return Future.value(const HistoryPage(messages: [], hasMore: false));
+    }
+    final completer = Completer<HistoryPage>();
+    _historyCompleter = completer;
+    _historyConvId = convId;
+    _sendFrame(ChatFrame(
+      type: 'msg/history',
+      from: _myNodeId,
+      to: _peerOf(convId),
+      payload: {'beforeSeq': beforeSeq, 'limit': limit},
+    ));
+    return completer.future.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        if (_historyCompleter == completer) {
+          _historyCompleter = null;
+          _historyConvId = null;
+        }
+        return const HistoryPage(messages: [], hasMore: false);
+      },
+    );
+  }
+
+  bool hasNoMoreHistory(String convId) => _noMoreHistory.contains(convId);
+
+  void resetHistoryPaging(String convId) {
+    _noMoreHistory.remove(convId);
+  }
+
+  void _onHistoryResult(ChatFrame frame) {
+    final completer = _historyCompleter;
+    final convId = _historyConvId;
+    _historyCompleter = null;
+    _historyConvId = null;
+
+    final hasMore = frame.payload?['hasMore'] == true;
+    final raw = (frame.payload?['messages'] as List?) ?? const [];
+    final loaded = <ChatMessage>[];
+    final conv = convId != null ? _conversations[convId] : null;
+    if (conv != null) {
+      for (final entry in raw) {
+        if (entry is! Map) continue;
+        final map = Map<String, dynamic>.from(entry);
+        final msg = ChatMessage(
+          clientId: (map['clientId'] as String?) ?? 's${map['ts']}-$convId',
+          conversationId: convId!,
+          senderId: map['sender'] as String? ?? '?',
+          text: map['text'] as String? ?? '',
+          createdAt: (map['ts'] as num?)?.toInt() ?? 0,
+          serverId: map['serverId'] as String?,
+          seq: (map['seq'] as num?)?.toInt(),
+          status: MessageStatus.sent,
+        );
+        // 去重。
+        if (conv.messages.any(
+          (m) =>
+              (msg.serverId != null && m.serverId == msg.serverId) ||
+              m.clientId == msg.clientId,
+        )) {
+          continue;
+        }
+        loaded.add(msg);
+      }
+      if (loaded.isNotEmpty) {
+        // 新页是旧→新；PREPEND 时逆序插入。
+        for (var i = loaded.length - 1; i >= 0; i--) {
+          conv.messages.insert(0, loaded[i]);
+        }
+        for (final m in loaded) {
+          unawaited(_db?.insertMessage(m));
+        }
+        _persistConversation(conv);
+        notifyListeners();
+      }
+      if (!hasMore) _noMoreHistory.add(convId!);
+    }
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(HistoryPage(messages: loaded, hasMore: hasMore));
+    }
+  }
+
+  // ─── 已读回执 ──────────────────────────────────────────────────────
+
+  /// 通知对方本会话已读到最新（打开会话 / 收到新消息时调用）。
+  void sendReadReceipt(String convId) {
+    final conv = _conversations[convId];
+    if (conv == null || conv.messages.isEmpty) return;
+    if (_status != ConnectionStatus.connected) return;
+    final latestTs = conv.messages.last.createdAt;
+    _sendFrame(ChatFrame(
+      type: 'read',
+      from: _myNodeId,
+      to: _peerOf(convId),
+      payload: {'upToTs': latestTs},
+    ));
+  }
+
+  void _onReadReceipt(ChatFrame frame) {
+    final from = frame.from;
+    if (from == null || from == _myNodeId) return;
+    final upToTs = (frame.payload?['upToTs'] as num?)?.toInt();
+    if (upToTs == null) return;
+    final convId = _convIdFor(_myNodeId!, from);
+    final conv = _conversations[convId];
+    if (conv == null) return;
+    var changed = false;
+    for (var i = 0; i < conv.messages.length; i++) {
+      final m = conv.messages[i];
+      if (!isMine(m)) continue;
+      if (m.createdAt > upToTs) continue;
+      if (m.status != MessageStatus.read) {
+        conv.messages[i] = m.copyWith(status: MessageStatus.read);
+        changed = true;
+      }
+    }
+    if (changed) {
+      _persistConversation(conv);
+      notifyListeners();
+    }
+  }
+
+  // ─── 打字指示 ──────────────────────────────────────────────────────
+
+  void sendTyping(String convId, {required bool on}) {
+    if (_status != ConnectionStatus.connected) return;
+    _sendFrame(ChatFrame(
+      type: 'typing',
+      from: _myNodeId,
+      to: _peerOf(convId),
+      payload: {'on': on},
+    ));
+  }
+
+  void _onTyping(ChatFrame frame) {
+    final from = frame.from;
+    if (from == null || from == _myNodeId) return;
+    final convId = _convIdFor(_myNodeId!, from);
+    final on = frame.payload?['on'] == true;
+    final ttls = _typingTtls.putIfAbsent(convId, () => {});
+    if (!on) {
+      ttls.remove(from)?.cancel();
+      _typingSenders[convId]?.remove(from);
+    } else {
+      _typingSenders.putIfAbsent(convId, () => {}).add(from);
+      ttls[from]?.cancel();
+      ttls[from] = Timer(_typingTtl, () {
+        ttls.remove(from);
+        _typingSenders[convId]?.remove(from);
+        notifyListeners();
+      });
+    }
+    notifyListeners();
+  }
+
+  bool isTyping(String convId) =>
+      _typingSenders[convId]?.isNotEmpty ?? false;
+
+  // ─── 在线名单 ──────────────────────────────────────────────────────
+
+  void _onPresence(ChatFrame frame) {
+    final raw = frame.payload?['online'];
+    if (raw is! List) return;
+    _onlineNodes.clear();
+    for (final item in raw) {
+      if (item is Map) {
+        final id = item['id'] as String?;
+        final name = item['name'] as String?;
+        if (id == null || id == _myNodeId) continue;
+        _onlineNodes.add(id);
+        if (name != null && name.isNotEmpty) _names[id] = name;
+      }
+    }
+    // 刷新 1:1 会话标题。
+    for (final entry in _names.entries) {
+      final conv = _conversations[entry.key];
+      if (conv != null && !conv.isGroup) conv.title = entry.value;
+    }
+    notifyListeners();
+  }
+
+  // ─── 工具 ──────────────────────────────────────────────────────────
+
+  static String _convIdFor(String a, String b) {
+    final ids = [a, b]..sort();
+    return '${ids[0]}:${ids[1]}';
+  }
+
+  /// 从 1:1 会话 id 中解析出对方 nodeId。
+  String _peerOf(String convId) {
+    final parts = convId.split(':');
+    for (final p in parts) {
+      if (p != _myNodeId) return p;
+    }
+    return parts.last;
+  }
+
+  static String _newClientId() {
+    final rand = Random().nextInt(1 << 32).toRadixString(36);
+    return 'c${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}-$rand';
+  }
+
+  void _sendFrame(ChatFrame frame) {
+    _conn?.output.write(encodeFrame(frame)).catchError((Object e) {
+      _fail('发送失败: $e');
+    });
+  }
+
+  void _persistMessage(ChatMessage msg) {
+    unawaited(_db?.insertMessage(msg));
+  }
+
+  void _persistConversation(Conversation conv) {
+    unawaited(_db?.upsertConversation(conv));
+  }
+
+  // ─── 心跳 / 断线 ───────────────────────────────────────────────────
+
+  void _startHeartbeat() {
+    _heartbeat?.cancel();
+    _heartbeat = Timer.periodic(const Duration(seconds: 30), (_) {
+      _sendFrame(const ChatFrame(type: 'ping'));
+      _pongTimeout?.cancel();
+      _pongTimeout = Timer(const Duration(seconds: 15), () {
+        _fail('心跳超时');
+      });
+    });
+  }
+
+  /// 重连成功后把仍处于 sending 状态的消息重新发出（幂等）。
+  /// 离线入队的消息此前无 ack 定时器，补发成功后重新武装。
+  void _flushPending() {
+    for (final p in List<_PendingSend>.of(_pending.values)) {
+      final conv = _conversations[p.convId];
+      if (conv == null) continue;
+      for (final m in conv.messages) {
+        if (m.clientId != p.clientId) continue;
+        if (m.status != MessageStatus.sending) break;
+        _sendMsg(to: p.to, clientId: p.clientId, text: m.text, ts: m.createdAt);
+        if (!p.wireSent) {
+          _trackPending(
+            convId: p.convId,
+            to: p.to,
+            clientId: p.clientId,
+            wireSent: true,
+          );
+        }
+        break;
+      }
+    }
+  }
+
+  void _onDisconnected() {
+    _teardown();
+    _setStatus(ConnectionStatus.disconnected, '已断开');
+    _maybeScheduleReconnect();
+  }
+
+  void _fail(String message) {
+    _teardown();
+    _lastError = message;
+    _setStatus(ConnectionStatus.failed, '连接失败');
+    _maybeScheduleReconnect();
+  }
+
+  void _setStatus(ConnectionStatus s, String text) {
+    _status = s;
+    _statusText = text;
+    notifyListeners();
+  }
+
+  /// 指数退避 + 抖动重连（1s→30s 封顶）。
+  void _maybeScheduleReconnect() {
+    if (!_autoReconnect || _status == ConnectionStatus.connected) return;
+    _reconnectTimer?.cancel();
+    _reconnectAttempt++;
+    final exp = (_reconnectAttempt - 1).clamp(0, 5);
+    final baseMs = min((1 << exp) * 1000, _maxReconnectSeconds * 1000);
+    final jitterMs = Random().nextInt(baseMs ~/ 5 + 1);
+    _setStatus(ConnectionStatus.reconnecting, '重连中…');
+    _reconnectTimer = Timer(Duration(milliseconds: baseMs + jitterMs), () {
+      final host = _hubHost;
+      final port = _hubPort;
+      if (host == null || port == null) return;
+      unawaited(
+        connect(hubHost: host, hubPort: port, hostname: _myHostname ?? '')
+            .catchError((_) {}),
+      );
+    });
+  }
+
+  void _teardown() {
+    _heartbeat?.cancel();
+    _heartbeat = null;
+    _pongTimeout?.cancel();
+    _pongTimeout = null;
+    _inputSub?.cancel();
+    _inputSub = null;
+    _conn?.close();
+    _conn = null;
+    _helloAck = null;
+    _onlineNodes.clear();
+    for (final ttls in _typingTtls.values) {
+      for (final t in ttls.values) {
+        t.cancel();
+      }
+    }
+    _typingTtls.clear();
+    _typingSenders.clear();
+  }
+
+  @override
+  void dispose() {
+    _autoReconnect = false;
+    _reconnectTimer?.cancel();
+    for (final p in _pending.values) {
+      p.timer?.cancel();
+    }
+    _pending.clear();
+    _teardown();
+    super.dispose();
+  }
+}
+
+class _PendingSend {
+  _PendingSend({
+    required this.convId,
+    required this.to,
+    required this.clientId,
+    required this.wireSent,
+    this.timer,
+  });
+
+  final String convId;
+  final String to;
+  final String clientId;
+
+  /// 是否已真正写入连接（true = 已武装 ack 超时；false = 离线入队）。
+  final bool wireSent;
+  final Timer? timer;
+}
