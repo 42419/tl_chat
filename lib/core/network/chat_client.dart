@@ -164,16 +164,26 @@ class ChatClient extends ChangeNotifier {
   /// 与 [peerId] 的 1:1 会话 id（双方各自计算一致）。
   String convIdForPeer(String peerId) => _convIdFor(_myNodeId ?? '', peerId);
 
+  /// 从 1:1 会话 id（"a:b"）解析出对方 nodeId；输入本身不是会话 id 则原样返回。
+  /// 防御用途：历史上出现过把会话 id 当 peer 递归拼接成 "a:a:b" 的脏数据，
+  /// 这里把任意层嵌套归一化回真正的对方节点。
+  String peerOfConvId(String id) {
+    if (_myNodeId == null || !id.contains(':')) return id;
+    return _peerOf(id);
+  }
+
   /// 获取（不存在则创建）与 [peerId] 的会话。
   Conversation conversationWith(String peerId) {
     final nodeId = _myNodeId;
     if (nodeId == null) {
       throw const ChatException('未连接');
     }
-    final convId = _convIdFor(nodeId, peerId);
+    // 防御：容忍调用方误传会话 id（如 "a:b"），归一化为真正的对方节点。
+    final peer = peerOfConvId(peerId);
+    final convId = _convIdFor(nodeId, peer);
     return _conversations.putIfAbsent(
       convId,
-      () => Conversation(id: convId, title: displayName(peerId)),
+      () => Conversation(id: convId, title: displayName(peer)),
     );
   }
 
@@ -189,6 +199,15 @@ class ChatClient extends ChangeNotifier {
       }
       final convs = await _db!.listConversations();
       for (final conv in convs) {
+        // 历史脏数据清理：合法 1:1 会话 id 恰好由两个节点 id 组成。
+        // 旧版 bug 会把会话 id 当 peer 递归拼接（"a:a:b"），这里直接丢弃。
+        final parts = conv.id.split(':');
+        final validId =
+            parts.length == 2 && parts[0].isNotEmpty && parts[1].isNotEmpty;
+        if (!validId) {
+          await _db!.deleteConversation(conv.id);
+          continue;
+        }
         final messages = await _db!.listMessages(conv.id, limit: 200);
         conv.messages.addAll(messages);
         if (messages.isNotEmpty) conv.lastMessage = messages.last;
@@ -412,6 +431,8 @@ class ChatClient extends ChangeNotifier {
     if (nodeId == null) {
       throw const ChatException('未连接');
     }
+    // 防御：容忍误传会话 id，归一化为真正的对方节点。
+    to = peerOfConvId(to);
     final clientId = _newClientId();
     final convId = _convIdFor(nodeId, to);
     final now = DateTime.now().millisecondsSinceEpoch;

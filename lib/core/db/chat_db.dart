@@ -115,6 +115,12 @@ class ChatDb {
     await _db.delete('messages', where: 'client_id = ?', whereArgs: [clientId]);
   }
 
+  /// 删除整个会话及其全部消息（用于清理历史脏数据）。
+  Future<void> deleteConversation(String id) async {
+    await _db.delete('messages', where: 'conv_id = ?', whereArgs: [id]);
+    await _db.delete('conversations', where: 'id = ?', whereArgs: [id]);
+  }
+
   Future<void> clearAll() async {
     await _db.delete('messages');
     await _db.delete('conversations');

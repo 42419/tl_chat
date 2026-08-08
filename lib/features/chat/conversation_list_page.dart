@@ -104,12 +104,15 @@ class ConversationListPage extends ConsumerWidget {
   }
 
   String? _peerOf(Conversation conv, String? myId) {
-    if (myId == null) return null;
     final parts = conv.id.split(':');
+    if (parts.length < 2 || parts[0].isEmpty || parts[1].isEmpty) {
+      return null; // 脏 id（如 "a:a:b"）不在此展开，交给 client 归一化。
+    }
+    if (myId == null) return parts[0]; // 未连接时取任一方，避免把 convId 当 peer。
     for (final p in parts) {
       if (p != myId) return p;
     }
-    return null;
+    return parts[0];
   }
 
   /// 发起聊天：底部弹层选择目标（在线节点 + 最近聊过的人）。
