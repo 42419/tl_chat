@@ -6,10 +6,16 @@
 //   - 历史按 (conv_id, seq) 索引游标分页
 'use strict';
 
+const fs = require('node:fs');
+const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 
 class Store {
   constructor(dbPath = ':memory:') {
+    // SQLite 不会自动创建父目录；文件型数据库先确保目录存在。
+    if (dbPath !== ':memory:') {
+      fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
+    }
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA journal_mode = WAL');
     this._init();
