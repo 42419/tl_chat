@@ -1,19 +1,18 @@
-# Release 打包：按 ABI 拆分构建 release APK 并上传。
+# Release 打包：Android APK（按 ABI 拆分）+ Linux deb，tag 自动发 Release。
 #
 # 触发方式：
 #   - 手动触发（Actions 页 Run workflow）
-#   - 推送 v* 标签（如 v1.0.0）→ 构建完成后自动创建 GitHub Release 并附加 APK
+#   - 推送 v* 标签（如 v1.0.0）→ 构建完成后自动创建 GitHub Release 并附加全部产物
 #
 # 要点：
 #   - tailscale 是 path 依赖（pubspec.yaml: ../tailscale_dart），必须 clone 到
 #     与本仓库同级的目录；来源：https://github.com/42419/tailscale_dart
-#   - tailscale_dart 的 native hook 需要 Go 1.26+ 与 Android NDK
-#     （hook 自动执行，无需手动调起）
-#   - release 构建使用 debug 签名（当前 build.gradle.kts 配置），可直接安装；
-#     若要上架商店需换成正式签名（后续可加 secrets）
-#   - Gradle / pub / Go 依赖均已缓存，加速重复构建
+#   - tailscale_dart 的 native hook 需要 Go 1.26+（Android 还需 NDK）
+#   - Android release 用 debug 签名（可直接安装；上架商店需正式签名）
+#   - Linux deb：仅 amd64（ubuntu-latest）
+#   - Gradle / pub / Go 依赖均已缓存
 
-name: Release APK
+name: Release
 
 on:
   workflow_dispatch:
@@ -30,6 +29,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ─── Android APK ──────────────────────────────────────────────────
   build-apk:
     name: Build APK (split per ABI)
     runs-on: ubuntu-latest
@@ -76,13 +76,6 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "using NDK: $NDK"
 
-      - name: Toolchain info
-        run: |
-          flutter --version
-          go version
-          java -version
-          echo "NDK: $ANDROID_NDK_HOME"
-
       - name: Resolve dependencies
         run: flutter pub get
 
@@ -115,9 +108,88 @@ jobs:
           path: build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
 
-      - name: Create GitHub Release（仅打标签时）
-        if: startsWith(github.ref, 'refs/tags/')
+  # ─── Linux deb（amd64）─────────────────────────────────────────────
+  build-linux-deb:
+    name: Build Linux deb (amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout tl_chat
+        uses: actions/checkout@v4
+
+      - name: Clone tailscale_dart（path 依赖须与本仓库同级）
+        run: |
+          git clone --depth 1 https://github.com/42419/tailscale_dart \
+            "$GITHUB_WORKSPACE/../tailscale_dart"
+          ls "$GITHUB_WORKSPACE/../tailscale_dart/go/go.mod"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.8'
+          cache: true
+
+      - name: Setup Go (tailscale_dart 原生库构建)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: ../tailscale_dart/go/go.sum
+
+      - name: Install Linux desktop build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev dpkg-dev
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Build Linux release
+        run: flutter build linux --release
+
+      - name: Package deb
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="dev"
+          fi
+          bash packaging/linux/build_deb.sh \
+            "build/linux/x64/release/bundle" \
+            "dist/tl-chat-${VERSION}-linux-amd64.deb" \
+            "${VERSION}" \
+            "amd64"
+          ls -lh dist/
+
+      - name: Upload Linux deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tl-chat-linux-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  # ─── GitHub Release（仅打标签时，收齐 APK + deb）──────────────────
+  release:
+    name: Publish GitHub Release
+    needs: [build-apk, build-linux-deb]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: build/app/outputs/flutter-apk/*.apk
+          files: dist/*
           generate_release_notes: true
