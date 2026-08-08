@@ -57,6 +57,11 @@ class ChatClient extends ChangeNotifier {
   String? _myNodeId;
   String? _myHostname;
 
+  /// 配对成功后服务端签发的长期身份令牌（首次注册才会下发一次）。
+  /// 调用方在 [connect] 成功返回后应检查此字段，非空则写回本地持久化
+  /// 的 [AppSettings]，下次连接时通过 [connect] 的 deviceToken 参数带上。
+  String? issuedDeviceToken;
+
   /// nodeId → 显示名（presence / 消息发送者学习；本地持久化，重启恢复）。
   final Map<String, String> _names = {};
 
@@ -266,16 +271,31 @@ class ChatClient extends ChangeNotifier {
 
   // ─── 连接管理 ──────────────────────────────────────────────────────
 
+  /// 本次连接使用的配对令牌 / 配对码（供断线重连时复用）。
+  String? _deviceToken;
+  String? _pairSecret;
+
   /// 连接中心服务。要求 Tailscale 已 [up]。连接成功后自动进入自动重连模式。
+  ///
+  /// [deviceToken]：已配对设备本地持久化的长期令牌，用于向服务端证明
+  /// 身份（服务端会校验其哈希是否与首次配对时绑定的一致）。
+  /// [pairSecret]：仅首次配对（服务端从未见过本机 nodeId）时需要，
+  /// 校验通过后服务端会通过 ack 下发一个新的 [issuedDeviceToken]，
+  /// 之后应改用 deviceToken 连接。
   Future<void> connect({
     required String hubHost,
     required int hubPort,
     required String hostname,
+    String? deviceToken,
+    String? pairSecret,
   }) async {
     if (_status == ConnectionStatus.connected) return;
     _hubHost = hubHost;
     _hubPort = hubPort;
     _myHostname = hostname;
+    _deviceToken = deviceToken;
+    _pairSecret = pairSecret;
+    issuedDeviceToken = null;
     _reconnectTimer?.cancel();
     _setStatus(ConnectionStatus.connecting, '连接中…');
 
@@ -313,7 +333,13 @@ class ChatClient extends ChangeNotifier {
         ChatFrame(
           type: 'hello',
           from: _myNodeId,
-          payload: {'hostname': hostname, 'cursors': cursors},
+          payload: {
+            'hostname': hostname,
+            'cursors': cursors,
+            if (_deviceToken != null) 'token': _deviceToken,
+            if (_deviceToken == null && _pairSecret != null)
+              'pairSecret': _pairSecret,
+          },
         ),
       );
       await waiter.future.timeout(
@@ -412,6 +438,15 @@ class ChatClient extends ChangeNotifier {
             if (k is String && v is String) _learnName(k, v);
           });
         }
+        final token = frame.payload?['token'] as String?;
+        if (token != null && token.isNotEmpty) {
+          // 首次配对签发的长期令牌：记住它，后续自动重连改用它而不是
+          // 一次性配对码（配对码可能已被调用方清空）。issuedDeviceToken
+          // 供外部持久化到 AppSettings。
+          issuedDeviceToken = token;
+          _deviceToken = token;
+          _pairSecret = null;
+        }
         hello.complete();
       } else {
         final error = frame.payload?['error'] ?? 'unknown';
@@ -474,12 +509,19 @@ class ChatClient extends ChangeNotifier {
 
   // ─── 发送 ──────────────────────────────────────────────────────────
 
+  /// 单条消息文本长度上限（字符数），需与服务端 MAX_TEXT_LENGTH 保持一致；
+  /// 提前在本地拦截，避免用户输完一大段文字才被服务端拒绝。
+  static const maxTextLength = 8000;
+
   /// 乐观发送一条文本消息。离线时消息先落本地，重连后自动冲刷。
   /// [forwardedFrom] 非空表示这是转发的消息（标注原发送者显示名）。
   ChatMessage sendText(String to, String text, {String? forwardedFrom}) {
     final trimmed = text.trim();
     if (trimmed.isEmpty) {
       throw const ChatException('空消息');
+    }
+    if (trimmed.length > maxTextLength) {
+      throw const ChatException('消息过长，请分段发送');
     }
     final nodeId = _myNodeId;
     if (nodeId == null) {
@@ -1059,6 +1101,7 @@ class ChatClient extends ChangeNotifier {
           hubHost: host,
           hubPort: port,
           hostname: _myHostname ?? '',
+          deviceToken: _deviceToken,
         ).catchError((_) {}),
       );
     });

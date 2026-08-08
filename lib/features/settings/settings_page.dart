@@ -143,6 +143,7 @@ class SettingsPage extends ConsumerWidget {
     final host = TextEditingController(text: settings.serverHost);
     final port = TextEditingController(text: '${settings.serverPort}');
     final authKey = TextEditingController();
+    final pairSecret = TextEditingController();
     final result = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -169,7 +170,16 @@ class SettingsPage extends ConsumerWidget {
               obscureText: true,
               decoration: const InputDecoration(
                 labelText: 'Auth key（可选）',
-                hintText: '首次注册 / 重新注册时填写',
+                hintText: 'Tailscale 组网用，首次注册 / 重新注册时填写',
+              ),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: pairSecret,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: '配对码（可选）',
+                hintText: '换了新服务地址时需要重新配对，填写向管理员获取的配对码',
               ),
             ),
           ],
@@ -190,23 +200,32 @@ class SettingsPage extends ConsumerWidget {
       host.dispose();
       port.dispose();
       authKey.dispose();
+      pairSecret.dispose();
       return;
     }
     final newHost = host.text.trim();
     final newPort = int.tryParse(port.text.trim()) ?? settings.serverPort;
     final key = authKey.text.trim();
+    final pair = pairSecret.text.trim();
     host.dispose();
     port.dispose();
     authKey.dispose();
+    pairSecret.dispose();
 
-    // 先把 key 放进内存中转，再更新设置触发重连（顺序不能反，
-    // 否则 _connect() 读到的 key 可能是旧的/空的）。
+    // 先把 key/配对码放进内存中转，再更新设置触发重连（顺序不能反，
+    // 否则 _connect() 读到的可能是旧的/空的）。
     if (key.isNotEmpty) SetupResult.authKey = key;
+    if (pair.isNotEmpty) SetupResult.pairSecret = pair;
     if (newHost.isNotEmpty) {
+      // 换了服务地址视为换了一台服务器：旧令牌是绑定在旧服务端数据库里
+      // 的，对新服务端毫无意义，必须清空、走一次全新配对（否则旧
+      // token 会被当成"无效令牌"拒绝，报错也让人摸不着头脑）。
+      final hostChanged = newHost != settings.serverHost;
       final updated = AppSettings(
         nickname: settings.nickname,
         serverHost: newHost,
         serverPort: newPort,
+        deviceToken: hostChanged ? null : settings.deviceToken,
       );
       await AppSettings.save(updated);
       ref.read(appSettingsProvider.notifier).state = updated;

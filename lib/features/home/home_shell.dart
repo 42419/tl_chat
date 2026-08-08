@@ -9,6 +9,7 @@ import '../../core/models/models.dart';
 import '../../core/network/chat_client.dart';
 import '../../core/network/tailscale_service.dart';
 import '../../core/providers.dart';
+import '../../core/settings/app_settings.dart';
 import '../../services/notification_service.dart';
 import '../chat/chat_page.dart';
 import '../chat/conversation_list_page.dart';
@@ -95,12 +96,28 @@ class _HomeShellState extends ConsumerState<HomeShell> {
       // 2. 解析服务地址（主机名 → tailnet IP）。
       final address = await _resolveAddress(settings.serverHost, tailscale);
 
-      // 3. 连接。
+      // 3. 连接（携带已持久化的设备令牌；若尚未配对过则携带一次性配对码）。
       await client.connect(
         hubHost: address,
         hubPort: settings.serverPort,
         hostname: settings.nickname,
+        deviceToken: settings.deviceToken,
+        pairSecret: settings.deviceToken == null ? SetupResult.pairSecret : null,
       );
+      // 走到这里说明 hello 已被接受（配对成功/令牌校验通过）：
+      // 一次性配对码不再需要，清掉避免留在内存里。若上面抛出异常
+      // （比如配对码错误），则保留它，方便用户改完地址直接重试。
+      SetupResult.pairSecret = null;
+
+      // 首次配对：服务端签发了新的长期令牌，写回本地持久化设置，
+      // 之后重连/重启都会带上它，而不再需要配对码。
+      final newToken = client.issuedDeviceToken;
+      if (newToken != null && newToken != settings.deviceToken) {
+        final updated = settings.withDeviceToken(newToken);
+        await AppSettings.save(updated);
+        ref.read(appSettingsProvider.notifier).state = updated;
+      }
+
       // 连接成功后启动前台保活（防止后台被系统杀掉导致断线）。
       unawaited(NotificationService.instance.startKeepAlive());
       if (mounted) {

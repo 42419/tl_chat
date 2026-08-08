@@ -23,6 +23,7 @@ class _SetupPageState extends ConsumerState<SetupPage> {
   final _serverHost = TextEditingController();
   final _serverPort = TextEditingController(text: '8600');
   final _authKey = TextEditingController();
+  final _pairSecret = TextEditingController();
 
   final _formKey = GlobalKey<FormState>();
   int _step = 0;
@@ -33,6 +34,7 @@ class _SetupPageState extends ConsumerState<SetupPage> {
     _serverHost.dispose();
     _serverPort.dispose();
     _authKey.dispose();
+    _pairSecret.dispose();
     super.dispose();
   }
 
@@ -41,6 +43,7 @@ class _SetupPageState extends ConsumerState<SetupPage> {
     final host = _serverHost.text.trim();
     final port = int.tryParse(_serverPort.text.trim()) ?? 8600;
     final authKey = _authKey.text.trim();
+    final pairSecret = _pairSecret.text.trim();
 
     final settings = AppSettings(
       nickname: nickname,
@@ -49,6 +52,7 @@ class _SetupPageState extends ConsumerState<SetupPage> {
     );
     await AppSettings.save(settings);
     SetupResult.authKey = authKey.isEmpty ? null : authKey;
+    SetupResult.pairSecret = pairSecret.isEmpty ? null : pairSecret;
     if (!mounted) return;
     ref.read(appSettingsProvider.notifier).state = settings;
     widget.onComplete?.call();
@@ -163,7 +167,10 @@ class _SetupPageState extends ConsumerState<SetupPage> {
           ),
           const SizedBox(height: 8),
           Text(
-            '输入管理员提供的内网服务地址。\n首次注册需要 Auth key（向管理员获取）。',
+            '输入管理员提供的内网服务地址。\n'
+            '首次注册需要 Auth key（Tailscale 组网用）和配对码\n'
+            '（App 身份配对用，服务端启动时打印或由管理员指定），\n'
+            '均向管理员获取。',
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
               color: scheme.onSurfaceVariant,
               height: 1.5,
@@ -194,8 +201,18 @@ class _SetupPageState extends ConsumerState<SetupPage> {
             obscureText: true,
             decoration: const InputDecoration(
               labelText: 'Auth key',
-              hintText: '首次注册必填，之后不再需要',
+              hintText: 'Tailscale 组网用，首次注册必填，之后不再需要',
               prefixIcon: Icon(Icons.key_outlined),
+            ),
+          ),
+          const SizedBox(height: 14),
+          TextField(
+            controller: _pairSecret,
+            obscureText: true,
+            decoration: const InputDecoration(
+              labelText: '配对码',
+              hintText: 'App 身份配对用，首次注册必填，之后不再需要',
+              prefixIcon: Icon(Icons.verified_user_outlined),
             ),
           ),
           const Spacer(),

@@ -43,6 +43,11 @@ class Store {
         name TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS node_tokens (
+        node_id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
     `);
     this._migrate();
   }
@@ -154,15 +159,42 @@ class Store {
     return row ? row.name : "";
   }
 
-  /** 某用户参与的全部会话 id。 */
+  /**
+   * 某用户参与的全部会话 id。
+   *
+   * 安全说明：nodeId 拼进 LIKE 模式前必须转义 `%`/`_`/转义符本身，否则
+   * 客户端自报的 nodeId 里塞入通配符（例如 "%"）会让模式变成能匹配任意
+   * conv_id 的 "%:%"，导致越权拉到全库所有会话（历史真实漏洞）。
+   */
   conversationsOf(nodeId) {
+    const escaped = String(nodeId).replace(/[\\%_]/g, "\\$&");
     const rows = this.db
       .prepare(
         `SELECT DISTINCT conv_id FROM messages
-         WHERE conv_id LIKE ? OR conv_id LIKE ?`,
+         WHERE conv_id LIKE ? ESCAPE '\\' OR conv_id LIKE ? ESCAPE '\\'`,
       )
-      .all(`${nodeId}:%`, `%:${nodeId}`);
+      .all(`${escaped}:%`, `%:${escaped}`);
     return rows.map((r) => r.conv_id);
+  }
+
+  // ─── 设备配对令牌（防身份伪造 / 会话劫持）────────────────────────
+
+  /** 节点已绑定的令牌哈希；未注册过返回 null。 */
+  tokenHashOf(nodeId) {
+    const row = this.db
+      .prepare("SELECT token_hash FROM node_tokens WHERE node_id = ?")
+      .get(nodeId);
+    return row ? row.token_hash : null;
+  }
+
+  /** 首次注册：绑定节点 → 令牌哈希（之后不可覆盖，见 server.js 校验逻辑）。 */
+  bindToken(nodeId, tokenHash) {
+    this.db
+      .prepare(
+        `INSERT INTO node_tokens (node_id, token_hash, created_at) VALUES (?, ?, ?)
+         ON CONFLICT(node_id) DO NOTHING`,
+      )
+      .run(nodeId, tokenHash, Date.now());
   }
 
   /** 某会话中 seq > cursor 的消息（旧→新），用于增量同步 / 离线补发。 */
