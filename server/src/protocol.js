@@ -5,13 +5,13 @@
 //   帧结构：{ type, from?, to?, conv?, ts?, payload? }
 // 详见 PROTOCOL.md。
 
-'use strict';
+"use strict";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 
 /** 编码一帧为长度前缀 Buffer。 */
 function encodeFrame(frame) {
-  const body = Buffer.from(JSON.stringify(frame), 'utf8');
+  const body = Buffer.from(JSON.stringify(frame), "utf8");
   if (body.length > MAX_FRAME_BYTES) {
     throw new Error(`frame too large: ${body.length} bytes`);
   }
@@ -36,7 +36,7 @@ class FrameDecoder {
       }
       if (this.buf.length < 4 + len) break;
       const body = this.buf.subarray(4, 4 + len);
-      frames.push(JSON.parse(body.toString('utf8')));
+      frames.push(JSON.parse(body.toString("utf8")));
       this.buf = Buffer.from(this.buf.subarray(4 + len));
     }
     return frames;

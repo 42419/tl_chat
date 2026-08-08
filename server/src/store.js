@@ -4,20 +4,20 @@
 //   - 每会话单调递增 seq（单进程同步执行，SELECT MAX → INSERT 原子无竞态）
 //   - (sender, client_id) 唯一索引实现发送幂等去重
 //   - 历史按 (conv_id, seq) 索引游标分页
-'use strict';
+"use strict";
 
-const fs = require('node:fs');
-const path = require('node:path');
-const { DatabaseSync } = require('node:sqlite');
+const fs = require("node:fs");
+const path = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
 
 class Store {
-  constructor(dbPath = ':memory:') {
+  constructor(dbPath = ":memory:") {
     // SQLite 不会自动创建父目录；文件型数据库先确保目录存在。
-    if (dbPath !== ':memory:') {
+    if (dbPath !== ":memory:") {
       fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
     }
     this.db = new DatabaseSync(dbPath);
-    this.db.exec('PRAGMA journal_mode = WAL');
+    this.db.exec("PRAGMA journal_mode = WAL");
     this._init();
   }
 
@@ -44,6 +44,23 @@ class Store {
         updated_at INTEGER NOT NULL
       );
     `);
+    this._migrate();
+  }
+
+  /** 幂等迁移：老库补列（撤回标记 / 转发来源），重复启动安全。 */
+  _migrate() {
+    const cols = this.db.prepare("PRAGMA table_info(messages)").all();
+    const names = new Set(cols.map((c) => c.name));
+    if (!names.has("recalled")) {
+      this.db.exec(
+        "ALTER TABLE messages ADD COLUMN recalled INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (!names.has("forwarded_from")) {
+      this.db.exec(
+        "ALTER TABLE messages ADD COLUMN forwarded_from TEXT NOT NULL DEFAULT ''",
+      );
+    }
   }
 
   close() {
@@ -52,34 +69,58 @@ class Store {
 
   /** 会话 id（1:1：双方 nodeId 排序后拼接，两端一致）。 */
   static convIdFor(a, b) {
-    return [a, b].sort().join(':');
+    return [a, b].sort().join(":");
   }
 
   /** 追加一条消息；重复 (sender, client_id) 返回已有记录（幂等）。 */
-  append({ convId, sender, clientId, text, ts }) {
+  append({ convId, sender, clientId, text, ts, forwardedFrom }) {
     this._ensureConversation(convId);
     const existing = this.db
-      .prepare('SELECT id, seq FROM messages WHERE sender = ? AND client_id = ?')
+      .prepare(
+        "SELECT id, seq FROM messages WHERE sender = ? AND client_id = ?",
+      )
       .get(sender, clientId);
     if (existing) {
-      return { serverId: String(existing.id), seq: existing.seq, duplicate: true };
+      return {
+        serverId: String(existing.id),
+        seq: existing.seq,
+        duplicate: true,
+      };
     }
     const row = this.db
-      .prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE conv_id = ?')
+      .prepare(
+        "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE conv_id = ?",
+      )
       .get(convId);
     const seq = row.next;
     const info = this.db
       .prepare(
-        'INSERT INTO messages (conv_id, sender, client_id, text, ts, seq) VALUES (?, ?, ?, ?, ?, ?)'
+        `INSERT INTO messages (conv_id, sender, client_id, text, ts, seq, forwarded_from)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(convId, sender, clientId, text, ts, seq);
+      .run(convId, sender, clientId, text, ts, seq, forwardedFrom || "");
     const id = Number(info.lastInsertRowid);
     return { serverId: String(id), seq, duplicate: false };
   }
 
+  /**
+   * 撤回：仅发送者可撤回自己的消息。返回收件人（1:1 会话另一方）与时间戳
+   * 供服务端广播；消息不存在或非本人所有返回 null。
+   */
+  markRecalled(id, sender) {
+    const row = this.db
+      .prepare("SELECT sender, conv_id, ts FROM messages WHERE id = ?")
+      .get(id);
+    if (!row || row.sender !== sender) return null;
+    this.db.prepare("UPDATE messages SET recalled = 1 WHERE id = ?").run(id);
+    const parts = String(row.conv_id).split(":");
+    const recipient = parts.find((p) => p !== sender) || null;
+    return { recipient, ts: Number(row.ts) };
+  }
+
   _ensureConversation(convId) {
     this.db
-      .prepare('INSERT OR IGNORE INTO conversations (conv_id) VALUES (?)')
+      .prepare("INSERT OR IGNORE INTO conversations (conv_id) VALUES (?)")
       .run(convId);
   }
 
@@ -92,14 +133,14 @@ class Store {
         `INSERT INTO nodes (node_id, name, updated_at) VALUES (?, ?, ?)
          ON CONFLICT(node_id) DO UPDATE SET
            name = excluded.name,
-           updated_at = excluded.updated_at`
+           updated_at = excluded.updated_at`,
       )
       .run(nodeId, name, Date.now());
   }
 
   /** 全部已知节点的 {nodeId: name}（hello ack 下发，客户端启动即知所有名字）。 */
   allNames() {
-    const rows = this.db.prepare('SELECT node_id, name FROM nodes').all();
+    const rows = this.db.prepare("SELECT node_id, name FROM nodes").all();
     const out = {};
     for (const r of rows) out[r.node_id] = r.name;
     return out;
@@ -108,9 +149,9 @@ class Store {
   /** 某节点的显示名；未知返回空串。 */
   nameOf(nodeId) {
     const row = this.db
-      .prepare('SELECT name FROM nodes WHERE node_id = ?')
+      .prepare("SELECT name FROM nodes WHERE node_id = ?")
       .get(nodeId);
-    return row ? row.name : '';
+    return row ? row.name : "";
   }
 
   /** 某用户参与的全部会话 id。 */
@@ -118,7 +159,7 @@ class Store {
     const rows = this.db
       .prepare(
         `SELECT DISTINCT conv_id FROM messages
-         WHERE conv_id LIKE ? OR conv_id LIKE ?`
+         WHERE conv_id LIKE ? OR conv_id LIKE ?`,
       )
       .all(`${nodeId}:%`, `%:${nodeId}`);
     return rows.map((r) => r.conv_id);
@@ -128,7 +169,7 @@ class Store {
   afterCursor(convId, cursor = 0, limit = 500) {
     const rows = this.db
       .prepare(
-        `SELECT * FROM messages WHERE conv_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`
+        `SELECT * FROM messages WHERE conv_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
       )
       .all(convId, cursor, limit);
     return rows.map((r) => this._toWire(r));
@@ -138,13 +179,13 @@ class Store {
   historyBefore(convId, beforeSeq, limit = 30) {
     const rows = this.db
       .prepare(
-        `SELECT * FROM messages WHERE conv_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?`
+        `SELECT * FROM messages WHERE conv_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?`,
       )
       .all(convId, beforeSeq, limit);
     return rows.reverse().map((r) => this._toWire(r));
   }
 
-  /** 消息行 → 线上格式；携带发送者持久化显示名（离线补发/历史分页也能学到名字）。 */
+  /** 消息行 → 线上格式；携带发送者持久化显示名、撤回标记与转发来源。 */
   _toWire(row) {
     return {
       serverId: String(row.id),
@@ -155,6 +196,8 @@ class Store {
       ts: row.ts,
       seq: row.seq,
       hostname: this.nameOf(row.sender),
+      recalled: Boolean(row.recalled),
+      forwardedFrom: row.forwarded_from || undefined,
     };
   }
 }

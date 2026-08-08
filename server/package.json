@@ -6,7 +6,11 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "format": "prettier --write src/ test/ PROTOCOL.md"
+  },
+  "devDependencies": {
+    "prettier": "^3.5.3"
   },
   "engines": {
     "node": ">=23.4"
