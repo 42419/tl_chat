@@ -70,9 +70,8 @@ class ConversationListPage extends ConsumerWidget {
                       children: [
                         Text(
                           _formatTime(conv.lastTs),
-                          style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                            color: scheme.onSurfaceVariant,
-                          ),
+                          style: Theme.of(context).textTheme.labelSmall
+                              ?.copyWith(color: scheme.onSurfaceVariant),
                         ),
                         const SizedBox(height: 4),
                         if (conv.unread > 0)
@@ -118,26 +117,16 @@ class ConversationListPage extends ConsumerWidget {
   /// 发起聊天：底部弹层选择目标（在线节点 + 最近聊过的人）。
   Future<void> _showNewChatSheet(BuildContext context, WidgetRef ref) async {
     final client = ref.read(chatClientProvider);
-    final candidates = <({String id, String name, bool online})>{};
-    for (final id in client.onlineNodes) {
-      candidates.add((id: id, name: client.displayName(id), online: true));
-    }
-    for (final conv in client.conversations) {
-      if (conv.isGroup) continue;
-      final peer = _peerOf(conv, client.myNodeId);
-      if (peer == null) continue;
-      candidates.add((id: peer, name: client.displayName(peer), online: false));
-    }
-    final list = candidates.toList()
+    final list = client.contactCandidates()
       ..sort((a, b) {
         if (a.online != b.online) return a.online ? -1 : 1;
         return a.name.compareTo(b.name);
       });
 
     if (list.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('暂无可聊的对象，稍后再试')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('暂无可聊的对象，稍后再试')));
       return;
     }
 
@@ -274,10 +263,7 @@ class _EmptyState extends StatelessWidget {
         children: [
           Icon(Icons.chat_bubble_outline, size: 56, color: scheme.outline),
           const SizedBox(height: 14),
-          Text(
-            '暂无会话',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
+          Text('暂无会话', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 6),
           Text(
             '从通讯录选择一个节点开始聊天',

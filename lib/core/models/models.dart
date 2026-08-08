@@ -11,11 +11,10 @@ enum MessageStatus {
   read,
   failed;
 
-  static MessageStatus parse(String? s) =>
-      MessageStatus.values.firstWhere(
-        (v) => v.name == s,
-        orElse: () => MessageStatus.sent,
-      );
+  static MessageStatus parse(String? s) => MessageStatus.values.firstWhere(
+    (v) => v.name == s,
+    orElse: () => MessageStatus.sent,
+  );
 }
 
 /// 连接状态（供 UI 展示连接横幅 / 重连提示）。
@@ -44,6 +43,7 @@ class ChatMessage {
     this.seq,
     this.status = MessageStatus.sending,
     this.recalled = false,
+    this.forwardedFrom,
   });
 
   /// 客户端生成的幂等 ID（发送前即存在，服务端按 (sender, clientId) 去重）。
@@ -69,11 +69,15 @@ class ChatMessage {
   /// 发送者是否撤回过（历史渲染为系统提示行）。
   final bool recalled;
 
+  /// 转发来源显示名（非本会话发送者时标注 "[转发]" 前缀）。
+  final String? forwardedFrom;
+
   ChatMessage copyWith({
     String? serverId,
     int? seq,
     MessageStatus? status,
     bool? recalled,
+    String? forwardedFrom,
   }) => ChatMessage(
     clientId: clientId,
     conversationId: conversationId,
@@ -84,6 +88,7 @@ class ChatMessage {
     seq: seq ?? this.seq,
     status: status ?? this.status,
     recalled: recalled ?? this.recalled,
+    forwardedFrom: forwardedFrom ?? this.forwardedFrom,
   );
 
   Map<String, dynamic> toMap() => {
@@ -96,6 +101,7 @@ class ChatMessage {
     'seq': seq,
     'status': status.name,
     'recalled': recalled ? 1 : 0,
+    'forwarded_from': forwardedFrom,
   };
 
   factory ChatMessage.fromMap(Map<String, dynamic> map) => ChatMessage(
@@ -108,6 +114,7 @@ class ChatMessage {
     seq: (map['seq'] as num?)?.toInt(),
     status: MessageStatus.parse(map['status'] as String?),
     recalled: (map['recalled'] as int? ?? 0) == 1,
+    forwardedFrom: map['forwarded_from'] as String?,
   );
 }
 

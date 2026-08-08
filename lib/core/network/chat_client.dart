@@ -93,6 +93,11 @@ class ChatClient extends ChangeNotifier {
   /// 当前打开的会话（UI 设置，用于未读计数与自动已读）。
   String? activeConversationId;
 
+  /// 入站新消息流（非本人消息），供通知/角标等 UI 外部消费。
+  final StreamController<ChatMessage> _incoming =
+      StreamController<ChatMessage>.broadcast();
+  Stream<ChatMessage> get incomingMessages => _incoming.stream;
+
   // ─── 自动重连 ──────────────────────────────────────────────────────
   String? _hubHost;
   int? _hubPort;
@@ -132,6 +137,42 @@ class ChatClient extends ChangeNotifier {
 
   /// 当前用户视角下消息是否为“我发的”。
   bool isMine(ChatMessage msg) => msg.senderId == _myNodeId;
+
+  /// 供 UI 构建“发起聊天 / 转发目标”候选列表：在线节点 + 最近聊过的人。
+  List<({String id, String name, bool online})> contactCandidates() {
+    final out = <({String id, String name, bool online})>{};
+    for (final id in _onlineNodes) {
+      out.add((id: id, name: displayName(id), online: true));
+    }
+    if (_myNodeId != null) {
+      for (final conv in _conversations.values) {
+        if (conv.isGroup) continue;
+        final peer = _peerOf(conv.id);
+        if (peer.isEmpty || peer == _myNodeId) continue;
+        out.add((id: peer, name: displayName(peer), online: false));
+      }
+    }
+    return out.toList();
+  }
+
+  /// 转发一条消息到 [targetId]（复用发送链路，附上原发送者显示名）。
+  void forwardMessage(String targetId, ChatMessage msg) {
+    if (msg.recalled || msg.text.isEmpty) return;
+    final originalSender = msg.senderId == _myNodeId
+        ? null
+        : displayName(msg.senderId);
+    sendText(targetId, msg.text, forwardedFrom: originalSender);
+  }
+
+  /// 撤回自己发过的一条消息（按服务端 serverId）。
+  void recallMessage(String serverId) {
+    if (_status != ConnectionStatus.connected || _myNodeId == null) return;
+    final id = int.tryParse(serverId);
+    if (id == null) return;
+    _sendFrame(
+      ChatFrame(type: 'msg/recall', from: _myNodeId, payload: {'id': id}),
+    );
+  }
 
   /// 从本机删除一条消息（仅本地，不影响服务端记录）。
   void deleteMessageLocally(String convId, String clientId) {
@@ -268,11 +309,13 @@ class ChatClient extends ChangeNotifier {
         for (final c in _conversations.values)
           if (c.lastSeq > 0) c.id: c.lastSeq,
       };
-      _sendFrame(ChatFrame(
-        type: 'hello',
-        from: _myNodeId,
-        payload: {'hostname': hostname, 'cursors': cursors},
-      ));
+      _sendFrame(
+        ChatFrame(
+          type: 'hello',
+          from: _myNodeId,
+          payload: {'hostname': hostname, 'cursors': cursors},
+        ),
+      );
       await waiter.future.timeout(
         const Duration(seconds: 20),
         onTimeout: () {
@@ -334,6 +377,9 @@ class ChatClient extends ChangeNotifier {
         break;
       case 'msg/history_result':
         _onHistoryResult(frame);
+        break;
+      case 'msg/recalled':
+        _onRecalled(frame);
         break;
       case 'read':
         _onReadReceipt(frame);
@@ -413,7 +459,14 @@ class ChatClient extends ChangeNotifier {
       }
       _persistConversation(conv);
       if (serverId != null || seq != null) {
-        unawaited(_db?.updateMessage(clientId, serverId: serverId, seq: seq, status: MessageStatus.sent));
+        unawaited(
+          _db?.updateMessage(
+            clientId,
+            serverId: serverId,
+            seq: seq,
+            status: MessageStatus.sent,
+          ),
+        );
       }
       notifyListeners();
     }
@@ -422,7 +475,8 @@ class ChatClient extends ChangeNotifier {
   // ─── 发送 ──────────────────────────────────────────────────────────
 
   /// 乐观发送一条文本消息。离线时消息先落本地，重连后自动冲刷。
-  ChatMessage sendText(String to, String text) {
+  /// [forwardedFrom] 非空表示这是转发的消息（标注原发送者显示名）。
+  ChatMessage sendText(String to, String text, {String? forwardedFrom}) {
     final trimmed = text.trim();
     if (trimmed.isEmpty) {
       throw const ChatException('空消息');
@@ -443,6 +497,7 @@ class ChatClient extends ChangeNotifier {
       text: trimmed,
       createdAt: now,
       status: MessageStatus.sending,
+      forwardedFrom: forwardedFrom,
     );
 
     final conv = _conversations.putIfAbsent(
@@ -459,10 +514,17 @@ class ChatClient extends ChangeNotifier {
       convId: convId,
       to: to,
       clientId: clientId,
+      forwardedFrom: forwardedFrom,
       wireSent: _status == ConnectionStatus.connected,
     );
     if (_status == ConnectionStatus.connected) {
-      _sendMsg(to: to, clientId: clientId, text: trimmed, ts: now);
+      _sendMsg(
+        to: to,
+        clientId: clientId,
+        text: trimmed,
+        ts: now,
+        forwardedFrom: forwardedFrom,
+      );
     }
     return msg;
   }
@@ -472,13 +534,21 @@ class ChatClient extends ChangeNotifier {
     required String clientId,
     required String text,
     required int ts,
+    String? forwardedFrom,
   }) {
-    _sendFrame(ChatFrame(
-      type: 'msg/send',
-      from: _myNodeId,
-      to: to,
-      payload: {'clientId': clientId, 'text': text, 'ts': ts},
-    ));
+    _sendFrame(
+      ChatFrame(
+        type: 'msg/send',
+        from: _myNodeId,
+        to: to,
+        payload: {
+          'clientId': clientId,
+          'text': text,
+          'ts': ts,
+          'forwardedFrom': ?forwardedFrom,
+        },
+      ),
+    );
   }
 
   /// 注册 pending。仅 [wireSent]（已真正写入连接）时武装 15s ack 超时；
@@ -487,6 +557,7 @@ class ChatClient extends ChangeNotifier {
     required String convId,
     required String to,
     required String clientId,
+    String? forwardedFrom,
     bool wireSent = false,
   }) {
     _pending[clientId]?.timer?.cancel();
@@ -494,6 +565,7 @@ class ChatClient extends ChangeNotifier {
       convId: convId,
       to: to,
       clientId: clientId,
+      forwardedFrom: forwardedFrom,
       wireSent: wireSent,
       timer: wireSent
           ? Timer(_ackTimeout, () {
@@ -528,10 +600,17 @@ class ChatClient extends ChangeNotifier {
           convId: conv.id,
           to: _peerOf(conv.id),
           clientId: clientId,
+          forwardedFrom: m.forwardedFrom,
           wireSent: _status == ConnectionStatus.connected,
         );
         if (_status == ConnectionStatus.connected) {
-          _sendMsg(to: _peerOf(conv.id), clientId: clientId, text: m.text, ts: m.createdAt);
+          _sendMsg(
+            to: _peerOf(conv.id),
+            clientId: clientId,
+            text: m.text,
+            ts: m.createdAt,
+            forwardedFrom: m.forwardedFrom,
+          );
         }
         notifyListeners();
         return;
@@ -553,6 +632,8 @@ class ChatClient extends ChangeNotifier {
     final serverId = map['serverId'] as String?;
     final seq = (map['seq'] as num?)?.toInt();
     final isMine = sender == _myNodeId;
+    final recalled = map['recalled'] == true;
+    final forwardedFrom = map['forwardedFrom'] as String?;
 
     final hostname = map['hostname'] as String?;
     if (hostname != null && hostname.isNotEmpty) {
@@ -570,12 +651,28 @@ class ChatClient extends ChangeNotifier {
       conv.title = isMine ? displayName(_peerOf(convId)) : displayName(sender);
     }
 
-    // 去重：同一 serverId 或 clientId 已存在则忽略。
-    if (conv.messages.any(
+    // 去重：同一 serverId 或 clientId 已存在则忽略；但离线补发带回的
+    // 撤回标记（此前错过了广播）要同步到本地副本。
+    final existing = conv.messages.where(
       (m) =>
           (serverId != null && m.serverId == serverId) ||
           m.clientId == clientId,
-    )) {
+    );
+    if (existing.isNotEmpty) {
+      if (recalled) {
+        for (final m in existing) {
+          if (m.recalled) continue;
+          final i = conv.messages.indexOf(m);
+          conv.messages[i] = m.copyWith(recalled: true);
+          if (conv.lastMessage?.serverId == serverId ||
+              conv.lastMessage?.clientId == clientId) {
+            conv.lastMessage = conv.messages[i];
+          }
+          unawaited(_db?.updateMessage(m.clientId, recalled: true));
+        }
+        _persistConversation(conv);
+        notifyListeners();
+      }
       return;
     }
 
@@ -588,6 +685,8 @@ class ChatClient extends ChangeNotifier {
       serverId: serverId,
       seq: seq,
       status: isMine ? MessageStatus.sent : MessageStatus.delivered,
+      recalled: recalled,
+      forwardedFrom: forwardedFrom,
     );
     conv.messages.add(msg);
     conv.lastMessage = msg;
@@ -604,6 +703,7 @@ class ChatClient extends ChangeNotifier {
       unawaited(_db?.incrementUnread(convId));
     }
 
+    if (!isMine) _incoming.add(msg);
     _persistMessage(msg);
     _persistConversation(conv);
     notifyListeners();
@@ -624,12 +724,14 @@ class ChatClient extends ChangeNotifier {
     final completer = Completer<HistoryPage>();
     _historyCompleter = completer;
     _historyConvId = convId;
-    _sendFrame(ChatFrame(
-      type: 'msg/history',
-      from: _myNodeId,
-      to: _peerOf(convId),
-      payload: {'beforeSeq': beforeSeq, 'limit': limit},
-    ));
+    _sendFrame(
+      ChatFrame(
+        type: 'msg/history',
+        from: _myNodeId,
+        to: _peerOf(convId),
+        payload: {'beforeSeq': beforeSeq, 'limit': limit},
+      ),
+    );
     return completer.future.timeout(
       const Duration(seconds: 10),
       onTimeout: () {
@@ -671,17 +773,34 @@ class ChatClient extends ChangeNotifier {
           serverId: map['serverId'] as String?,
           seq: (map['seq'] as num?)?.toInt(),
           status: MessageStatus.sent,
+          recalled: map['recalled'] == true,
+          forwardedFrom: map['forwardedFrom'] as String?,
         );
         final hostname = map['hostname'] as String?;
         if (hostname != null && hostname.isNotEmpty) {
           _learnName(msg.senderId, hostname);
         }
-        // 去重。
-        if (conv.messages.any(
+        // 去重；若历史页带回撤回标记且本地副本未标记，则同步标记。
+        final existing = conv.messages.where(
           (m) =>
               (msg.serverId != null && m.serverId == msg.serverId) ||
               m.clientId == msg.clientId,
-        )) {
+        );
+        if (existing.isNotEmpty) {
+          if (msg.recalled) {
+            var changed = false;
+            for (final m in existing) {
+              if (m.recalled) continue;
+              final i = conv.messages.indexOf(m);
+              conv.messages[i] = m.copyWith(recalled: true);
+              unawaited(_db?.updateMessage(m.clientId, recalled: true));
+              changed = true;
+            }
+            if (changed) {
+              _persistConversation(conv);
+              notifyListeners();
+            }
+          }
           continue;
         }
         loaded.add(msg);
@@ -704,6 +823,28 @@ class ChatClient extends ChangeNotifier {
     }
   }
 
+  /// msg/recalled：他人（或本机其他会话）撤回了消息——按 serverId 把本地
+  /// 消息标记为已撤回，渲染为系统提示行。
+  void _onRecalled(ChatFrame frame) {
+    final id = frame.payload?['id'];
+    if (id == null) return;
+    final idStr = '$id';
+    for (final conv in _conversations.values) {
+      for (var i = 0; i < conv.messages.length; i++) {
+        final m = conv.messages[i];
+        if (m.serverId != idStr) continue;
+        conv.messages[i] = m.copyWith(recalled: true);
+        if (conv.lastMessage?.serverId == idStr) {
+          conv.lastMessage = conv.messages[i];
+        }
+        unawaited(_db?.updateMessage(m.clientId, recalled: true));
+        _persistConversation(conv);
+        notifyListeners();
+        return;
+      }
+    }
+  }
+
   // ─── 已读回执 ──────────────────────────────────────────────────────
 
   /// 通知对方本会话已读到最新（打开会话 / 收到新消息时调用）。
@@ -712,12 +853,14 @@ class ChatClient extends ChangeNotifier {
     if (conv == null || conv.messages.isEmpty) return;
     if (_status != ConnectionStatus.connected) return;
     final latestTs = conv.messages.last.createdAt;
-    _sendFrame(ChatFrame(
-      type: 'read',
-      from: _myNodeId,
-      to: _peerOf(convId),
-      payload: {'upToTs': latestTs},
-    ));
+    _sendFrame(
+      ChatFrame(
+        type: 'read',
+        from: _myNodeId,
+        to: _peerOf(convId),
+        payload: {'upToTs': latestTs},
+      ),
+    );
   }
 
   void _onReadReceipt(ChatFrame frame) {
@@ -748,12 +891,14 @@ class ChatClient extends ChangeNotifier {
 
   void sendTyping(String convId, {required bool on}) {
     if (_status != ConnectionStatus.connected) return;
-    _sendFrame(ChatFrame(
-      type: 'typing',
-      from: _myNodeId,
-      to: _peerOf(convId),
-      payload: {'on': on},
-    ));
+    _sendFrame(
+      ChatFrame(
+        type: 'typing',
+        from: _myNodeId,
+        to: _peerOf(convId),
+        payload: {'on': on},
+      ),
+    );
   }
 
   void _onTyping(ChatFrame frame) {
@@ -777,8 +922,7 @@ class ChatClient extends ChangeNotifier {
     notifyListeners();
   }
 
-  bool isTyping(String convId) =>
-      _typingSenders[convId]?.isNotEmpty ?? false;
+  bool isTyping(String convId) => _typingSenders[convId]?.isNotEmpty ?? false;
 
   // ─── 在线名单 ──────────────────────────────────────────────────────
 
@@ -857,12 +1001,19 @@ class ChatClient extends ChangeNotifier {
       for (final m in conv.messages) {
         if (m.clientId != p.clientId) continue;
         if (m.status != MessageStatus.sending) break;
-        _sendMsg(to: p.to, clientId: p.clientId, text: m.text, ts: m.createdAt);
+        _sendMsg(
+          to: p.to,
+          clientId: p.clientId,
+          text: m.text,
+          ts: m.createdAt,
+          forwardedFrom: m.forwardedFrom,
+        );
         if (!p.wireSent) {
           _trackPending(
             convId: p.convId,
             to: p.to,
             clientId: p.clientId,
+            forwardedFrom: m.forwardedFrom,
             wireSent: true,
           );
         }
@@ -904,8 +1055,11 @@ class ChatClient extends ChangeNotifier {
       final port = _hubPort;
       if (host == null || port == null) return;
       unawaited(
-        connect(hubHost: host, hubPort: port, hostname: _myHostname ?? '')
-            .catchError((_) {}),
+        connect(
+          hubHost: host,
+          hubPort: port,
+          hostname: _myHostname ?? '',
+        ).catchError((_) {}),
       );
     });
   }
@@ -939,6 +1093,7 @@ class ChatClient extends ChangeNotifier {
     }
     _pending.clear();
     _teardown();
+    unawaited(_incoming.close());
     super.dispose();
   }
 }
@@ -948,6 +1103,7 @@ class _PendingSend {
     required this.convId,
     required this.to,
     required this.clientId,
+    this.forwardedFrom,
     required this.wireSent,
     this.timer,
   });
@@ -955,6 +1111,7 @@ class _PendingSend {
   final String convId;
   final String to;
   final String clientId;
+  final String? forwardedFrom;
 
   /// 是否已真正写入连接（true = 已武装 ack 超时；false = 离线入队）。
   final bool wireSent;

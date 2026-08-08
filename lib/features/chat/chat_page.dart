@@ -40,6 +40,10 @@ class _ChatPageState extends ConsumerState<ChatPage> {
 
   Timer? _typingDebounce;
 
+  /// 多选模式（长按菜单进入；底部切换为批量操作栏）。
+  bool _multiSelect = false;
+  final Set<String> _selected = {};
+
   @override
   void initState() {
     super.initState();
@@ -192,35 +196,48 @@ class _ChatPageState extends ConsumerState<ChatPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              _peerTitle,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
-            ),
-            Text(
-              typing
-                  ? '正在输入…'
-                  : (online ? '在线' : '离线'),
-              style: TextStyle(
-                fontSize: 12,
-                color: typing
-                    ? scheme.primary
-                    : (online
-                          ? Colors.green
-                          : scheme.onSurfaceVariant),
+        leading: _multiSelect
+            ? IconButton(
+                icon: const Icon(Icons.close),
+                tooltip: '取消',
+                onPressed: _exitMultiSelect,
+              )
+            : null,
+        title: _multiSelect
+            ? Text(
+                '已选 ${_selected.length} 条',
+                style: const TextStyle(
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600,
+                ),
+              )
+            : Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    _peerTitle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  Text(
+                    typing ? '正在输入…' : (online ? '在线' : '离线'),
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: typing
+                          ? scheme.primary
+                          : (online ? Colors.green : scheme.onSurfaceVariant),
+                    ),
+                  ),
+                ],
               ),
-            ),
-          ],
-        ),
       ),
       body: Column(
         children: [
-          if (_loadingHistory)
-            const LinearProgressIndicator(minHeight: 2),
+          if (_loadingHistory) const LinearProgressIndicator(minHeight: 2),
           Expanded(
             child: messages.isEmpty
                 ? _emptyState(scheme)
@@ -239,19 +256,30 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                           final older = i < messages.length - 1
                               ? messages[messages.length - 2 - i]
                               : null;
-                          final showDate = older == null ||
+                          final showDate =
+                              older == null ||
                               !_sameDay(older.createdAt, msg.createdAt);
                           return Column(
                             children: [
                               if (showDate) _dateChip(msg.createdAt, scheme),
-                              _MessageBubble(
-                                msg: msg,
-                                isMine: client.isMine(msg),
-                                peerTitle: _peerTitle,
-                                connected: client.status.isConnected,
-                                onLongPress: () =>
-                                    _showMessageMenu(context, msg),
-                              ),
+                              if (msg.recalled)
+                                _recalledLine(msg, scheme, client)
+                              else
+                                _MessageBubble(
+                                  msg: msg,
+                                  isMine: client.isMine(msg),
+                                  peerTitle: _peerTitle,
+                                  connected: client.status.isConnected,
+                                  selected:
+                                      _multiSelect &&
+                                      _selected.contains(msg.clientId),
+                                  onTap: _multiSelect
+                                      ? () => _toggleSelect(msg.clientId)
+                                      : null,
+                                  onLongPress: _multiSelect
+                                      ? () => _toggleSelect(msg.clientId)
+                                      : () => _showMessageMenu(context, msg),
+                                ),
                             ],
                           );
                         },
@@ -263,7 +291,10 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                           right: 0,
                           child: Center(
                             child: ActionChip(
-                              avatar: const Icon(Icons.arrow_downward, size: 16),
+                              avatar: const Icon(
+                                Icons.arrow_downward,
+                                size: 16,
+                              ),
                               label: Text('$_newCount 条新消息'),
                               onPressed: () {
                                 setState(() => _newCount = 0);
@@ -275,7 +306,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                     ],
                   ),
           ),
-          _inputBar(scheme, client),
+          _multiSelect ? _batchBar(scheme) : _inputBar(scheme, client),
         ],
       ),
     );
@@ -288,10 +319,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
         children: [
           Icon(Icons.waving_hand_outlined, size: 52, color: scheme.outline),
           const SizedBox(height: 12),
-          Text(
-            '打个招呼吧',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
+          Text('打个招呼吧', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 4),
           Text(
             '对方离线时消息会暂存在服务端，上线后自动送达',
@@ -308,10 +336,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Text(
         label,
-        style: TextStyle(
-          fontSize: 12,
-          color: scheme.onSurfaceVariant,
-        ),
+        style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
       ),
     );
   }
@@ -368,7 +393,11 @@ class _ChatPageState extends ConsumerState<ChatPage> {
   Future<void> _showMessageMenu(BuildContext context, ChatMessage msg) async {
     final client = ref.read(chatClientProvider);
     final messenger = ScaffoldMessenger.of(context);
-    final failed = client.isMine(msg) && msg.status == MessageStatus.failed;
+    final isMine = client.isMine(msg);
+    final failed = isMine && msg.status == MessageStatus.failed;
+    // 可撤回：自己的、非失败、未被撤回、已有 serverId（已到达服务端）。
+    final canRecall =
+        isMine && !msg.recalled && !failed && msg.serverId != null;
     final action = await showModalBottomSheet<String>(
       context: context,
       builder: (ctx) => SafeArea(
@@ -380,12 +409,28 @@ class _ChatPageState extends ConsumerState<ChatPage> {
               title: const Text('复制'),
               onTap: () => Navigator.pop(ctx, 'copy'),
             ),
+            ListTile(
+              leading: const Icon(Icons.forward_outlined),
+              title: const Text('转发'),
+              onTap: () => Navigator.pop(ctx, 'forward'),
+            ),
+            if (canRecall)
+              ListTile(
+                leading: const Icon(Icons.undo),
+                title: const Text('撤回'),
+                onTap: () => Navigator.pop(ctx, 'recall'),
+              ),
             if (failed)
               ListTile(
                 leading: const Icon(Icons.refresh),
                 title: const Text('重发'),
                 onTap: () => Navigator.pop(ctx, 'resend'),
               ),
+            ListTile(
+              leading: const Icon(Icons.library_add_check_outlined),
+              title: const Text('多选'),
+              onTap: () => Navigator.pop(ctx, 'select'),
+            ),
             ListTile(
               leading: const Icon(Icons.delete_outline),
               title: const Text('删除（本机）'),
@@ -403,13 +448,227 @@ class _ChatPageState extends ConsumerState<ChatPage> {
           const SnackBar(content: Text('已复制'), duration: Duration(seconds: 1)),
         );
         break;
+      case 'forward':
+        await _forwardSingle(msg);
+        break;
+      case 'recall':
+        if (!client.status.isConnected) {
+          messenger.showSnackBar(const SnackBar(content: Text('离线状态无法撤回')));
+        } else {
+          client.recallMessage(msg.serverId!);
+          messenger.showSnackBar(
+            const SnackBar(
+              content: Text('已撤回'),
+              duration: Duration(seconds: 1),
+            ),
+          );
+        }
+        break;
       case 'resend':
         client.resend(msg.clientId);
+        break;
+      case 'select':
+        setState(() {
+          _multiSelect = true;
+          _selected.add(msg.clientId);
+        });
         break;
       case 'delete':
         client.deleteMessageLocally(_convId, msg.clientId);
         break;
     }
+  }
+
+  // ─── 多选 / 转发 ────────────────────────────────────────────────────
+
+  void _exitMultiSelect() {
+    setState(() {
+      _selected.clear();
+      _multiSelect = false;
+    });
+  }
+
+  void _toggleSelect(String clientId) {
+    setState(() {
+      if (!_selected.remove(clientId)) _selected.add(clientId);
+    });
+  }
+
+  /// 选择转发目标（在线节点 + 最近聊过的人），返回 null 表示取消。
+  Future<String?> _pickForwardTarget(ChatClient client) async {
+    final list = client.contactCandidates()
+      ..sort((a, b) {
+        if (a.online != b.online) return a.online ? -1 : 1;
+        return a.name.compareTo(b.name);
+      });
+    if (list.isEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('暂无可转发对象')));
+      return null;
+    }
+    return showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+              child: Row(
+                children: [
+                  Text(
+                    '转发给',
+                    style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: list.length,
+                itemBuilder: (ctx, i) {
+                  final c = list[i];
+                  return ListTile(
+                    leading: CircleAvatar(
+                      radius: 18,
+                      backgroundColor: Theme.of(
+                        ctx,
+                      ).colorScheme.secondaryContainer,
+                      child: Text(
+                        c.name.isNotEmpty ? c.name[0].toUpperCase() : '?',
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: Theme.of(ctx).colorScheme.onSecondaryContainer,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    title: Text(c.name),
+                    subtitle: Text(c.online ? '在线' : '离线'),
+                    onTap: () => Navigator.pop(ctx, c.id),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _forwardSingle(ChatMessage msg) async {
+    final client = ref.read(chatClientProvider);
+    final target = await _pickForwardTarget(client);
+    if (target == null || !mounted) return;
+    client.forwardMessage(target, msg);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已转发'), duration: Duration(seconds: 1)),
+    );
+  }
+
+  Future<void> _forwardSelected() async {
+    final client = ref.read(chatClientProvider);
+    final target = await _pickForwardTarget(client);
+    if (target == null || !mounted) return;
+    final conv = client.conversationById(_convId);
+    final msgs = (conv?.messages ?? const <ChatMessage>[])
+        .where((m) => _selected.contains(m.clientId))
+        .toList();
+    for (final m in msgs) {
+      client.forwardMessage(target, m);
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('已转发 ${msgs.length} 条'),
+        duration: const Duration(seconds: 1),
+      ),
+    );
+    _exitMultiSelect();
+  }
+
+  Future<void> _deleteSelected() async {
+    final client = ref.read(chatClientProvider);
+    final count = _selected.length;
+    if (count == 0) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除消息'),
+        content: Text('确定删除选中的 $count 条消息？（仅本机删除）'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final conv = client.conversationById(_convId);
+    final msgs = (conv?.messages ?? const <ChatMessage>[])
+        .where((m) => _selected.contains(m.clientId))
+        .toList();
+    for (final m in msgs) {
+      client.deleteMessageLocally(_convId, m.clientId);
+    }
+    _exitMultiSelect();
+  }
+
+  Widget _recalledLine(ChatMessage msg, ColorScheme scheme, ChatClient client) {
+    final who = client.isMine(msg) ? '你' : _peerTitle;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Center(
+        child: Text(
+          '$who 撤回了一条消息',
+          style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+        ),
+      ),
+    );
+  }
+
+  /// 多选模式下的批量操作栏（转发 / 删除）。
+  Widget _batchBar(ColorScheme scheme) {
+    final count = _selected.length;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: scheme.surface,
+        border: Border(top: BorderSide(color: scheme.outlineVariant)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Row(
+          children: [
+            TextButton.icon(
+              onPressed: count == 0 ? null : _forwardSelected,
+              icon: const Icon(Icons.forward_outlined),
+              label: const Text('转发'),
+            ),
+            const Spacer(),
+            Text(
+              '已选 $count 条',
+              style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+            ),
+            const Spacer(),
+            TextButton.icon(
+              onPressed: count == 0 ? null : _deleteSelected,
+              icon: Icon(Icons.delete_outline, color: scheme.error),
+              label: Text('删除', style: TextStyle(color: scheme.error)),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   static bool _sameDay(int a, int b) {
@@ -440,6 +699,8 @@ class _MessageBubble extends StatelessWidget {
     required this.peerTitle,
     required this.connected,
     required this.onLongPress,
+    this.selected = false,
+    this.onTap,
   });
 
   final ChatMessage msg;
@@ -447,6 +708,8 @@ class _MessageBubble extends StatelessWidget {
   final String peerTitle;
   final bool connected;
   final VoidCallback onLongPress;
+  final bool selected;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -454,15 +717,14 @@ class _MessageBubble extends StatelessWidget {
     final bubbleColor = isMine
         ? scheme.primaryContainer
         : scheme.surfaceContainerHighest;
-    final textColor = isMine
-        ? scheme.onPrimaryContainer
-        : scheme.onSurface;
+    final textColor = isMine ? scheme.onPrimaryContainer : scheme.onSurface;
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 2),
       child: Row(
-        mainAxisAlignment:
-            isMine ? MainAxisAlignment.end : MainAxisAlignment.start,
+        mainAxisAlignment: isMine
+            ? MainAxisAlignment.end
+            : MainAxisAlignment.start,
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
           if (!isMine) ...[
@@ -483,6 +745,7 @@ class _MessageBubble extends StatelessWidget {
           Flexible(
             child: GestureDetector(
               onLongPress: onLongPress,
+              onTap: onTap,
               child: Container(
                 constraints: BoxConstraints(
                   maxWidth: MediaQuery.of(context).size.width * 0.68,
@@ -499,11 +762,26 @@ class _MessageBubble extends StatelessWidget {
                     bottomLeft: Radius.circular(isMine ? 16 : 4),
                     bottomRight: Radius.circular(isMine ? 4 : 16),
                   ),
+                  border: selected
+                      ? Border.all(color: scheme.primary, width: 2)
+                      : null,
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.end,
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    if (msg.forwardedFrom != null &&
+                        msg.forwardedFrom!.isNotEmpty) ...[
+                      Text(
+                        '转发自 ${msg.forwardedFrom}',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: textColor.withValues(alpha: 0.7),
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                    ],
                     Text(
                       msg.text,
                       style: TextStyle(
@@ -569,8 +847,9 @@ class _MessageBubble extends StatelessWidget {
       MessageStatus.failed => Icons.error_outline,
     };
     final color = switch (status) {
-      MessageStatus.sending || MessageStatus.sent || MessageStatus.delivered =>
-        textColor.withValues(alpha: 0.55),
+      MessageStatus.sending ||
+      MessageStatus.sent ||
+      MessageStatus.delivered => textColor.withValues(alpha: 0.55),
       MessageStatus.read => scheme.primary,
       MessageStatus.failed => scheme.error,
     };

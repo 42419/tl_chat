@@ -11,7 +11,7 @@ class ChatDb {
   ChatDb._(this._db);
 
   static const _dbName = 'chat.db';
-  static const _dbVersion = 2;
+  static const _dbVersion = 3;
 
   final Database _db;
 
@@ -26,7 +26,7 @@ class ChatDb {
     return ChatDb._(db);
   }
 
-  /// v1 → v2：新增 names 表（nodeId → 显示名，重启后恢复昵称）。
+  /// v1 → v2：新增 names 表；v3：messages 增加 forwarded_from 列。
   static Future<void> _upgradeSchema(
     Database db,
     int oldVersion,
@@ -36,6 +36,9 @@ class ChatDb {
       await db.execute(
         'CREATE TABLE names (node_id TEXT PRIMARY KEY, name TEXT NOT NULL)',
       );
+    }
+    if (oldVersion < 3) {
+      await db.execute("ALTER TABLE messages ADD COLUMN forwarded_from TEXT");
     }
   }
 
@@ -87,10 +90,7 @@ class ChatDb {
 
   /// 按最近活动排序的会话列表。
   Future<List<Conversation>> listConversations() async {
-    final rows = await _db.query(
-      'conversations',
-      orderBy: 'last_ts DESC',
-    );
+    final rows = await _db.query('conversations', orderBy: 'last_ts DESC');
     return rows.map(Conversation.fromMap).toList();
   }
 
@@ -129,18 +129,15 @@ class ChatDb {
   // ─── 节点显示名（持久化，重启后恢复）────────────────────────────────
 
   Future<void> upsertName(String nodeId, String name) async {
-    await _db.insert(
-      'names',
-      {'node_id': nodeId, 'name': name},
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    await _db.insert('names', {
+      'node_id': nodeId,
+      'name': name,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<Map<String, String>> loadNames() async {
     final rows = await _db.query('names');
-    return {
-      for (final r in rows) r['node_id'] as String: r['name'] as String,
-    };
+    return {for (final r in rows) r['node_id'] as String: r['name'] as String};
   }
 
   // ─── 消息 ──────────────────────────────────────────────────────────
