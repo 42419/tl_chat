@@ -212,9 +212,9 @@ class SettingsPage extends ConsumerWidget {
       ref.read(appSettingsProvider.notifier).state = updated;
     }
     if (!context.mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('设置已保存，正在重新连接…')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('设置已保存，正在重新连接…')));
   }
 
   Future<void> _confirmClearCache(BuildContext context, WidgetRef ref) async {
@@ -252,7 +252,9 @@ class SettingsPage extends ConsumerWidget {
         ListTile(
           contentPadding: EdgeInsets.zero,
           title: const Text('技术栈'),
-          subtitle: const Text('Flutter · Material 3 · tailscale_dart · Node.js'),
+          subtitle: const Text(
+            'Flutter · Material 3 · tailscale_dart · Node.js',
+          ),
         ),
       ],
     );

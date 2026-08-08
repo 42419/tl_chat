@@ -18,14 +18,15 @@ class ContactsPage extends ConsumerWidget {
     // 离线联系人：从会话中解析出真正的对方节点 id（会话 id 形如 "a:b"，
     // 不能直接当联系人展示；旧版 bug 曾把会话 id 当 peer 递归拼接成
     // "a:a:b"，peerOfConvId 会把任意层嵌套归一化回对方节点）。
-    final knownOffline = client.conversations
-        .where((c) => !c.isGroup)
-        .map((c) => client.peerOfConvId(c.id))
-        .where((id) => !client.onlineNodes.contains(id))
-        .where((id) => id != client.myNodeId)
-        .toSet()
-        .toList()
-      ..sort();
+    final knownOffline =
+        client.conversations
+            .where((c) => !c.isGroup)
+            .map((c) => client.peerOfConvId(c.id))
+            .where((id) => !client.onlineNodes.contains(id))
+            .where((id) => id != client.myNodeId)
+            .toSet()
+            .toList()
+          ..sort();
 
     return Scaffold(
       appBar: AppBar(title: const Text('通讯录')),

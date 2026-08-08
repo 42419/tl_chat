@@ -106,9 +106,9 @@ class _SetupPageState extends ConsumerState<SetupPage> {
       children: [
         Text(
           '设置你的昵称',
-          style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-            fontWeight: FontWeight.w700,
-          ),
+          style: Theme.of(
+            context,
+          ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
         ),
         const SizedBox(height: 8),
         Text(
@@ -133,9 +133,9 @@ class _SetupPageState extends ConsumerState<SetupPage> {
         FilledButton.icon(
           onPressed: () {
             if (_nickname.text.trim().isEmpty) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('请输入昵称')),
-              );
+              ScaffoldMessenger.of(
+                context,
+              ).showSnackBar(const SnackBar(content: Text('请输入昵称')));
               return;
             }
             setState(() => _step = 1);
@@ -157,9 +157,9 @@ class _SetupPageState extends ConsumerState<SetupPage> {
         children: [
           Text(
             '连接聊天服务',
-            style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-              fontWeight: FontWeight.w700,
-            ),
+            style: Theme.of(
+              context,
+            ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
           ),
           const SizedBox(height: 8),
           Text(
@@ -210,9 +210,9 @@ class _SetupPageState extends ConsumerState<SetupPage> {
                 onPressed: () {
                   final host = _serverHost.text.trim();
                   if (host.isEmpty) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('请输入服务地址')),
-                    );
+                    ScaffoldMessenger.of(
+                      context,
+                    ).showSnackBar(const SnackBar(content: Text('请输入服务地址')));
                     return;
                   }
                   final port = int.tryParse(_serverPort.text.trim());

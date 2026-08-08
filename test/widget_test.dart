@@ -14,9 +14,7 @@ import 'package:tl_chat/core/providers.dart';
 import 'package:tl_chat/core/settings/app_settings.dart';
 
 Widget _app(AppSettings settings) => ProviderScope(
-  overrides: [
-    appSettingsProvider.overrideWith((ref) => settings),
-  ],
+  overrides: [appSettingsProvider.overrideWith((ref) => settings)],
   child: const ChatApp(),
 );
 
@@ -42,14 +40,13 @@ void main() {
 
   testWidgets('主界面路由：保存设置后切换主界面', (tester) async {
     final container = ProviderContainer(
-      overrides: [appSettingsProvider.overrideWith((ref) => const AppSettings())],
+      overrides: [
+        appSettingsProvider.overrideWith((ref) => const AppSettings()),
+      ],
     );
     addTearDown(container.dispose);
     await tester.pumpWidget(
-      UncontrolledProviderScope(
-        container: container,
-        child: const ChatApp(),
-      ),
+      UncontrolledProviderScope(container: container, child: const ChatApp()),
     );
     await tester.pump();
     expect(find.text('设置你的昵称'), findsOneWidget);

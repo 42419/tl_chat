@@ -46,7 +46,8 @@ class ChatFrame {
     to: json['to'] as String?,
     conv: json['conv'] as String?,
     ts: json['ts'] as int?,
-    payload: (json['payload'] as Map<String, dynamic>?)?.cast<String, dynamic>(),
+    payload: (json['payload'] as Map<String, dynamic>?)
+        ?.cast<String, dynamic>(),
   );
 }
 
@@ -78,18 +79,17 @@ class FrameDecoder {
 
     var offset = 0;
     while (bytes.length - offset >= 4) {
-      final len = ByteData.sublistView(bytes, offset, offset + 4).getUint32(
-        0,
-        Endian.big,
-      );
+      final len = ByteData.sublistView(
+        bytes,
+        offset,
+        offset + 4,
+      ).getUint32(0, Endian.big);
       if (len > maxFrameBytes) {
         throw const FormatException('frame too large');
       }
       if (bytes.length - offset < 4 + len) break;
       final body = utf8.decode(bytes.sublist(offset + 4, offset + 4 + len));
-      frames.add(
-        ChatFrame.fromJson(jsonDecode(body) as Map<String, dynamic>),
-      );
+      frames.add(ChatFrame.fromJson(jsonDecode(body) as Map<String, dynamic>));
       offset += 4 + len;
     }
     if (offset < bytes.length) {
